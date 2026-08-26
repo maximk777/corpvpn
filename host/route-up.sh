@@ -40,8 +40,9 @@ vm_ip="$(lima sh -c "ip -4 -o addr show dev lima0 | awk '{print \$4}' | cut -d/ 
 
 subnets="${CORP_SUBNETS:-}"
 if [[ -z "$subnets" ]]; then
-  # оба туннеля: tun0 (Cisco) и tun1 (OpenVPN)
-  subnets="$(lima sh -c 'ip -4 route show dev tun0 2>/dev/null; ip -4 route show dev tun1 2>/dev/null' | awk '$1!="default"{print $1}' | sort -u)"
+  # tun0 (Cisco) и, если есть, tun1. `|| true`, чтобы отсутствие tun1 не роняло
+  # скрипт (set -e + pipefail: `ip route show dev tun1` без tun1 = не-ноль).
+  subnets="$(lima sh -c 'ip -4 route show dev tun0 2>/dev/null; ip -4 route show dev tun1 2>/dev/null; true' | awk '$1!="default"{print $1}' | sort -u)"
 fi
 [[ -n "$subnets" ]] || { echo "не нашёл подсетей за tun0/tun1 -- туннель поднят?" >&2; exit 1; }
 

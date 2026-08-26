@@ -528,16 +528,37 @@ func cmdUp() error {
 
 // cmdHeal -- то, что раз в 30с дёргает watchdog. Молча выходит, если всё живо
 // или если VM намеренно погашена; иначе переподнимает VPN (без маршрутов, sudo не нужно).
+// cmdHeal -- то, что раз в 30с дёргает watchdog. Полное фоновое восстановление
+// гостевой части (egress -> Cisco -> OpenVPN), без sudo. Маршруты/резолвер на Mac
+// переживают сон, поэтому route-up тут не нужен (и не смогли бы -- нет sudo).
 func cmdHeal() error {
-	if !vmRunning() || !ifaceUp(egressTun) {
+	if !vmRunning() {
 		return nil
 	}
-	if ifaceUp(vpnTun) {
-		return nil
+	needCisco := !ifaceUp(vpnTun)
+	needOvpn := os.Getenv("OVPN_CONFIG") != "" && !ifaceUp(ovpnTun)
+	if !needCisco && !needOvpn {
+		return nil // всё живо -- молчим
 	}
-	fmt.Fprintln(os.Stderr, "[heal] tun0 упал -- переподнимаю VPN")
-	notify("🖕 VPN отвалился — переподключаюсь…")
-	return connectVPN(false)
+
+	fmt.Fprintln(os.Stderr, "[heal] что-то упало -- переподнимаю в фоне")
+	notify("🖕 отвалился — химися бро, скоро всё будет")
+
+	if needCisco {
+		// connectCisco сам пересоберёт несвежий egress (после сна) и поднимет Cisco.
+		if err := connectCisco(); err != nil {
+			notify("🖕 бля бля бля, не получилось захилиться")
+			return err
+		}
+	}
+	if os.Getenv("OVPN_CONFIG") != "" && !ifaceUp(ovpnTun) {
+		if err := ovpnUp(); err != nil {
+			notify("🖕 бля бля бля, OpenVPN не захилился")
+			return err
+		}
+	}
+	notify("✅ захилился, всё поднято")
+	return nil
 }
 
 func cmdWatchdog(args []string) error {

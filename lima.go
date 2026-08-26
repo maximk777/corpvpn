@@ -65,19 +65,20 @@ func ifaceUp(name string) bool {
 // повторный запуск при живом туннеле ничего не ломает.
 func ensureEgress(socksAddr string, proxyDNS bool) error {
 	if ifaceUp(egressTun) {
+		// Egress считаем живым, только если ВСЁ сходится: default через tun-egress,
+		// юнит на нужный прокси И tun2socks реально active. После сна интерфейс
+		// остаётся, а tun2socks дохнет -- это и есть "несвежее" состояние, из-за
+		// которого up падал (шлюз "не отвечает") и спасал только ручной down.
 		def, _ := guest("ip", "-4", "route", "show", "default")
-		if strings.Contains(def, egressTun) {
-			// Туннель уже есть -- но, возможно, в ДРУГОЙ прокси. Молча оставить
-			// его значило бы дать думать, что трафик идёт через новый адрес.
-			unit, _ := guest("systemctl", "show", "corpvpn-tun2socks",
-				"-p", "ExecStart", "--value")
-			if strings.Contains(unit, socksAddr) {
-				return nil
-			}
-			fmt.Fprintf(os.Stderr, "egress поднят через другой прокси -- пересобираю на %s\n", socksAddr)
-			if err := guestPassthrough("sudo", guestDir+"/guest/egress-down.sh"); err != nil {
-				return err
-			}
+		unit, _ := guest("systemctl", "show", "corpvpn-tun2socks", "-p", "ExecStart", "--value")
+		active, _ := guest("systemctl", "is-active", "corpvpn-tun2socks")
+		if strings.Contains(def, egressTun) && strings.Contains(unit, socksAddr) &&
+			strings.TrimSpace(active) == "active" {
+			return nil
+		}
+		fmt.Fprintln(os.Stderr, "egress несвежий (tun2socks умер?) -- пересобираю")
+		if err := guestPassthrough("sudo", guestDir+"/guest/egress-down.sh"); err != nil {
+			return err
 		}
 	}
 	dns := "0"

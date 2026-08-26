@@ -27,7 +27,7 @@ provision:
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
       apt-get install -y --no-install-recommends \
-        openconnect vpnc-scripts iproute2 iptables nftables \
+        openconnect openvpn vpnc-scripts iproute2 iptables nftables \
         socat curl ca-certificates dnsutils unzip jq iputils-ping tmux
 
       # tun2socks: заворачивает весь IP-трафик tun-устройства в SOCKS5.

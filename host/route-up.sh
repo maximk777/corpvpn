@@ -32,9 +32,10 @@ vm_ip="$(lima sh -c "ip -4 -o addr show dev lima0 | awk '{print \$4}' | cut -d/ 
 
 subnets="${CORP_SUBNETS:-}"
 if [[ -z "$subnets" ]]; then
-  subnets="$(lima ip -4 route show dev tun0 | awk '$1!="default"{print $1}')"
+  # оба туннеля: tun0 (Cisco) и tun1 (OpenVPN)
+  subnets="$(lima sh -c 'ip -4 route show dev tun0 2>/dev/null; ip -4 route show dev tun1 2>/dev/null' | awk '$1!="default"{print $1}' | sort -u)"
 fi
-[[ -n "$subnets" ]] || { echo "не нашёл подсетей за tun0 -- туннель поднят?" >&2; exit 1; }
+[[ -n "$subnets" ]] || { echo "не нашёл подсетей за tun0/tun1 -- туннель поднят?" >&2; exit 1; }
 
 asuser sh -c ": > '$STATE/routes'"
 for net in $subnets; do
@@ -54,13 +55,12 @@ for net in $subnets; do
   fi
 done
 
-# Корп-DNS достаём устойчиво: systemd-resolved в госте прячет их за стабом
-# 127.0.0.53, а сразу после reconnect линк вообще может быть пуст. Порядок:
-# CORP_DNS из .env -> не-loopback nameserver'ы из resolv.conf -> resolvectl ->
-# кэш прошлого успешного запуска. Найденное кэшируем в STATE/corp-dns.
+# Корп-DNS берём НАСТОЯЩИЙ -- тот, что пушит шлюз (его ловит guest/vpnc-hook.sh
+# в /run/corpvpn/vpn-dns). systemd-resolved прячет реальный DNS, а из resolv.conf/
+# resolvectl можно случайно схватить локальные шлюзы (192.168.x) -- поэтому их не берём.
+# Порядок: CORP_DNS из .env -> перехваченный DNS шлюза -> кэш прошлого запуска.
 vpn_dns="${CORP_DNS:-}"
-[[ -n "$vpn_dns" ]] || vpn_dns="$(lima sh -c "awk '/^nameserver/ && \$2 !~ /^127\./ {print \$2}' /etc/resolv.conf")"
-[[ -n "$vpn_dns" ]] || vpn_dns="$(lima sh -c "resolvectl status 2>/dev/null | awk '/DNS Servers:/{for(i=3;i<=NF;i++) if(\$i ~ /^[0-9.]+$/ && \$i !~ /^127\./) print \$i}'" | sort -u)"
+[[ -n "$vpn_dns" ]] || vpn_dns="$(lima sh -c 'awk -F= "/^DNS=/{print \$2}" /run/corpvpn/vpn-dns 2>/dev/null')"
 [[ -n "$vpn_dns" ]] || { [[ -f "$STATE/corp-dns" ]] && vpn_dns="$(cat "$STATE/corp-dns")" && echo "корп-DNS из кэша: $(echo $vpn_dns | tr '\n' ' ')"; }
 if [[ -n "$vpn_dns" ]]; then
   asuser sh -c "printf '%s\n' '$(echo $vpn_dns | tr '\n' ' ')' | tr ' ' '\n' | sed '/^$/d' > '$STATE/corp-dns'"

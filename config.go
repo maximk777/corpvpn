@@ -25,6 +25,11 @@ func repoRoot() string {
 		}
 	}
 	if exe, err := os.Executable(); err == nil {
+		// corpvpn ставится симлинком в /usr/local/bin -- резолвим его до реального
+		// dist/corpvpn внутри репо, иначе host/*.sh рядом не найдётся.
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = real
+		}
 		dir := filepath.Dir(exe)
 		for {
 			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {

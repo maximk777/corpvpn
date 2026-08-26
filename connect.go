@@ -152,7 +152,7 @@ func startTmuxSession(gateway, user string, noDTLS bool) error {
 	_, _ = guest("sudo", "tmux", "kill-session", "-t", tmuxName)
 
 	oc := []string{"openconnect", "--protocol=anyconnect",
-		"--script=/usr/share/vpnc-scripts/vpnc-script"}
+		"--script=" + guestDir + "/guest/vpnc-hook.sh"}
 	if user != "" {
 		oc = append(oc, "--user="+user)
 	}

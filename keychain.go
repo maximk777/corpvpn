@@ -19,6 +19,7 @@ const (
 	acctUsername = "username"
 	acctPassword = "password"
 	acctTOTP     = "totp-secret"
+	acctOVPNKey  = "ovpn-key-pass" // passphrase на приватный ключ Wildberries-OpenVPN
 )
 
 func credSet(account, secret string) error {

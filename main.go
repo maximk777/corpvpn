@@ -147,10 +147,23 @@ func cmdCreds(args []string) error {
 		}
 		fmt.Printf("сохранено. текущий код: %s (годен %d с)\n",
 			cfg.codeAt(time.Now()), cfg.validFor(time.Now()))
+
+		// Опционально: passphrase на приватный ключ Wildberries-OpenVPN.
+		fmt.Fprintln(os.Stderr, "OpenVPN: пароль на приватный ключ (.ovpn). Enter -- пропустить.")
+		ovpnPass, err := promptSecret("ovpn key pass")
+		if err != nil {
+			return err
+		}
+		if ovpnPass != "" {
+			if err := credSet(acctOVPNKey, ovpnPass); err != nil {
+				return err
+			}
+			fmt.Println("passphrase ключа OpenVPN сохранён")
+		}
 		return nil
 
 	case "check":
-		for _, a := range []string{acctUsername, acctPassword, acctTOTP} {
+		for _, a := range []string{acctUsername, acctPassword, acctTOTP, acctOVPNKey} {
 			mark := "нет"
 			if credExists(a) {
 				mark = "есть"
@@ -159,8 +172,23 @@ func cmdCreds(args []string) error {
 		}
 		return cmdCode()
 
+	case "ovpn":
+		// Только passphrase на ключ OpenVPN -- чтобы не перевводить остальные креды.
+		p, err := promptSecret("ovpn key pass")
+		if err != nil {
+			return err
+		}
+		if p == "" {
+			return fmt.Errorf("пусто -- ничего не сохранил")
+		}
+		if err := credSet(acctOVPNKey, p); err != nil {
+			return err
+		}
+		fmt.Println("passphrase ключа OpenVPN сохранён")
+		return nil
+
 	case "rm":
-		for _, a := range []string{acctUsername, acctPassword, acctTOTP} {
+		for _, a := range []string{acctUsername, acctPassword, acctTOTP, acctOVPNKey} {
 			if err := credDelete(a); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", a, err)
 			}
@@ -233,9 +261,9 @@ func pickGateway(cands []string) (string, error) {
 	return "", fmt.Errorf("ни один шлюз не ответил через прокси: %s", strings.Join(cands, ", "))
 }
 
-// connectVPN поднимает egress через РФ-SOCKS и корп-VPN. Если alsoRoute --
-// сразу настраивает маршруты и DNS на Mac (это и есть `up`, одна кнопка).
-func connectVPN(alsoRoute bool) error {
+// connectCisco поднимает egress через РФ-SOCKS и Cisco AnyConnect (tun0).
+// Маршруты на Mac и OpenVPN -- отдельными шагами (см. connectVPN/cmdUp).
+func connectCisco() error {
 	socks := env("SOCKS_ADDR", "192.168.64.1:1081")
 	proxyDNS := env("PROXY_DNS", "1") == "1"
 
@@ -295,19 +323,26 @@ func connectVPN(alsoRoute bool) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\nтуннель поднят. подсети за ним: %d\n", len(nets))
+	fmt.Printf("\nCisco поднят. подсети за tun0: %d\n", len(nets))
 	_ = ip
 	notify("✅ подключено к " + gateway)
+	return nil
+}
 
+// connectVPN -- Cisco + (опционально) маршруты на Mac. Для `connect` и свитча шлюза.
+func connectVPN(alsoRoute bool) error {
+	if err := connectCisco(); err != nil {
+		return err
+	}
 	if alsoRoute {
 		fmt.Fprintln(os.Stderr, "\nнастраиваю маршруты и DNS на Mac...")
 		if err := hostRouteUp(); err != nil {
 			return fmt.Errorf("маршруты на Mac не поднялись: %w", err)
 		}
-		fmt.Println("\nготово. корп-хосты открываются с Mac по имени. Проверка: corpvpn check")
+		fmt.Println("\nготово. Проверка: corpvpn check")
 		return nil
 	}
-	fmt.Printf("\nчтобы эти адреса открылись с Mac напрямую:\n  ./host/route-up.sh\n")
+	fmt.Printf("\nчтобы эти адреса открылись с Mac:\n  corpvpn up   (или ./host/route-up.sh)\n")
 	return nil
 }
 
@@ -371,12 +406,14 @@ func cmdCheck() error {
 		if !strings.Contains(h, "://") {
 			url = "https://" + h + "/"
 		}
-		out, err := guest("sh", "-c",
-			fmt.Sprintf("curl -sS --max-time 12 -o /dev/null -w '%%{http_code} %%{remote_ip}' %s", url))
-		if err != nil {
-			fmt.Printf("  ✗ %-28s %v\n", h, err)
-		} else {
+		// С Mac (через /etc/resolver + маршруты в гостя) -- как в браузере.
+		out, err := macCurl(url)
+		code := strings.Fields(out)
+		ok := err == nil && len(code) > 0 && code[0] != "000" && code[0] != ""
+		if ok {
 			fmt.Printf("  ✓ %-28s %s\n", h, out)
+		} else {
+			fmt.Printf("  ✗ %-28s %s\n", h, orDash(out))
 		}
 	}
 	return nil
@@ -416,6 +453,17 @@ func cmdStatus() error {
 		fmt.Println("VPN:       ✗ не подключён")
 	}
 
+	// OpenVPN (tun1) -- показываем, только если он настроен (OVPN_CONFIG) или поднят.
+	if os.Getenv("OVPN_CONFIG") != "" || ifaceUp(ovpnTun) {
+		if ifaceUp(ovpnTun) {
+			addr, _ := guest("sh", "-c", "ip -4 -o addr show tun1 | awk '{print $4}'")
+			nets, _ := guest("sh", "-c", "ip -4 route show dev tun1 | awk '$1!=\"default\"{print $1}' | wc -l")
+			fmt.Printf("OpenVPN:   ✓ поднят (tun1, адрес %s, подсетей %s)\n", orDash(addr), strings.TrimSpace(orDash(nets)))
+		} else {
+			fmt.Println("OpenVPN:   ✗ не поднят")
+		}
+	}
+
 	fmt.Printf("watchdog:  %s %s\n", mark(agentIsLoaded(watchdogAgentLabel)), loadedWord(agentIsLoaded(watchdogAgentLabel)))
 	return nil
 }
@@ -453,14 +501,28 @@ func openconnectGateway() string {
 }
 
 func cmdUp() error {
-	if err := connectVPN(true); err != nil {
+	if err := connectCisco(); err != nil {
 		return err
+	}
+	// OpenVPN (Wildberries) рядом, на tun1 -- если задан OVPN_CONFIG.
+	if os.Getenv("OVPN_CONFIG") != "" {
+		fmt.Fprintln(os.Stderr, "\nподнимаю OpenVPN в песочнице (tun1)...")
+		if err := ovpnUp(); err != nil {
+			fmt.Fprintf(os.Stderr, "OpenVPN не поднялся: %v\n(Cisco работает; wildberries-ресурсы пока недоступны)\n", err)
+		} else {
+			notify("✅ OpenVPN поднят (tun1)")
+		}
+	}
+	fmt.Fprintln(os.Stderr, "\nнастраиваю маршруты и DNS на Mac...")
+	if err := hostRouteUp(); err != nil {
+		return fmt.Errorf("маршруты на Mac не поднялись: %w", err)
 	}
 	if err := installWatchdogAgent(); err != nil {
 		fmt.Fprintf(os.Stderr, "watchdog не встал: %v (VPN поднят, просто без авто-реконнекта)\n", err)
 	} else {
 		fmt.Println("watchdog включён: если VPN упадёт -- поднимет сам. Остановить всё: corpvpn down")
 	}
+	fmt.Println("\nготово. Проверка: corpvpn check")
 	return nil
 }
 
@@ -515,6 +577,7 @@ func cmdDown() error {
 		fmt.Println("VM не запущена -- на Mac всё снято")
 		return nil
 	}
+	ovpnDown() // погасить OpenVPN (tun1), если поднят
 	_, _ = guest("sudo", "tmux", "kill-session", "-t", tmuxName)
 	if err := guestPassthrough("sudo", guestDir+"/guest/egress-down.sh"); err != nil {
 		return err

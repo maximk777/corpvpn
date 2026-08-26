@@ -1,0 +1,44 @@
+# Песочница для VPN-клиента: весь egress гостя уходит в SOCKS5 на хосте.
+# vmType vz + vzNAT обязательны: они дают VM IP, маршрутизируемый с macOS,
+# без этого не работает "уровень 3" (доступ к корп-хостам по реальным IP).
+base: template://ubuntu-24.04
+vmType: vz
+cpus: 2
+memory: 2GiB
+disk: 20GiB
+
+networks:
+  - vzNAT: true
+
+containerd:
+  system: false
+  user: false
+
+mounts:
+  - location: "__REPO__"
+    mountPoint: /opt/corpvpn
+    writable: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        openconnect vpnc-scripts iproute2 iptables nftables \
+        socat curl ca-certificates dnsutils unzip jq iputils-ping tmux
+
+      # tun2socks: заворачивает весь IP-трафик tun-устройства в SOCKS5.
+      # Берём последний релиз, чтобы не привязываться к версии.
+      if ! command -v tun2socks >/dev/null; then
+        arch=$(dpkg --print-architecture)   # arm64
+        url=$(curl -fsSL https://api.github.com/repos/xjasonlyu/tun2socks/releases/latest \
+              | jq -r ".assets[] | select(.name==\"tun2socks-linux-${arch}.zip\") | .browser_download_url")
+        test -n "$url"
+        curl -fsSL -o /tmp/tun2socks.zip "$url"
+        unzip -o /tmp/tun2socks.zip -d /tmp/tun2socks
+        install -m 0755 /tmp/tun2socks/tun2socks-linux-${arch} /usr/local/bin/tun2socks
+      fi
+      tun2socks --version

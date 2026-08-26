@@ -1,0 +1,15 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "tag": "from-sandbox",
+    "listen": "192.168.64.1",
+    "port": 1080,
+    "protocol": "socks",
+    "settings": {"auth": "noauth", "udp": false}
+  }],
+  "outbounds": [{
+    "tag": "to-streisand",
+    "protocol": "socks",
+    "settings": {"servers": [{"address": "::1", "port": 10811}]}
+  }]
+}

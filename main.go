@@ -121,9 +121,19 @@ func cmdCreds(args []string) error {
 		fmt.Fprintln(os.Stderr, "  - otpauth://... (Passwords.app: File -> Export, в CSV колонка otpauth)")
 		fmt.Fprintln(os.Stderr, "  - otpauth-migration://... (Google Authenticator: Перенос аккаунтов -> QR)")
 		fmt.Fprintln(os.Stderr, "  - голый base32-секрет")
+		fmt.Fprintln(os.Stderr, "  (можно вставить путь к скриншоту QR-кода — распознаю сам)")
 		seed, err := promptSecret("totp")
 		if err != nil {
 			return err
+		}
+		// Вставили путь к картинке со скриншотом QR? Распознаём.
+		if looksLikeImagePath(seed) {
+			fmt.Fprintln(os.Stderr, "распознаю QR из картинки...")
+			decoded, e := decodeQRImage(seed)
+			if e != nil {
+				return fmt.Errorf("не распознать QR: %w", e)
+			}
+			seed = decoded
 		}
 		cfg, err := parseTOTP(seed)
 		if err != nil {
@@ -453,15 +463,10 @@ func cmdStatus() error {
 		fmt.Println("VPN:       ✗ не подключён")
 	}
 
-	// OpenVPN (tun1) -- показываем, только если он настроен (OVPN_CONFIG) или поднят.
-	if os.Getenv("OVPN_CONFIG") != "" || ifaceUp(ovpnTun) {
-		if ifaceUp(ovpnTun) {
-			addr, _ := guest("sh", "-c", "ip -4 -o addr show tun1 | awk '{print $4}'")
-			nets, _ := guest("sh", "-c", "ip -4 route show dev tun1 | awk '$1!=\"default\"{print $1}' | wc -l")
-			fmt.Printf("OpenVPN:   ✓ поднят (tun1, адрес %s, подсетей %s)\n", orDash(addr), strings.TrimSpace(orDash(nets)))
-		} else {
-			fmt.Println("OpenVPN:   ✗ не поднят")
-		}
+	// OpenVPN (tun1) -- показываем только если реально поднят (обычно нет: SSO-gated).
+	if ifaceUp(ovpnTun) {
+		addr, _ := guest("sh", "-c", "ip -4 -o addr show tun1 | awk '{print $4}'")
+		fmt.Printf("OpenVPN:   ✓ поднят (tun1, адрес %s)\n", orDash(addr))
 	}
 
 	fmt.Printf("watchdog:  %s %s\n", mark(agentIsLoaded(watchdogAgentLabel)), loadedWord(agentIsLoaded(watchdogAgentLabel)))
@@ -504,15 +509,8 @@ func cmdUp() error {
 	if err := connectCisco(); err != nil {
 		return err
 	}
-	// OpenVPN (Wildberries) рядом, на tun1 -- если задан OVPN_CONFIG.
-	if os.Getenv("OVPN_CONFIG") != "" {
-		fmt.Fprintln(os.Stderr, "\nподнимаю OpenVPN в песочнице (tun1)...")
-		if err := ovpnUp(); err != nil {
-			fmt.Fprintf(os.Stderr, "OpenVPN не поднялся: %v\n(Cisco работает; wildberries-ресурсы пока недоступны)\n", err)
-		} else {
-			notify("✅ OpenVPN поднят (tun1)")
-		}
-	}
+	// OpenVPN (Wildberries) SSO-gated -- headless в песочнице доступа не даёт,
+	// поэтому в `up` не поднимаем. Стейдж и т.п. -- родным OpenVPN Connect на Mac.
 	fmt.Fprintln(os.Stderr, "\nнастраиваю маршруты и DNS на Mac...")
 	if err := hostRouteUp(); err != nil {
 		return fmt.Errorf("маршруты на Mac не поднялись: %w", err)

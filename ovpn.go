@@ -94,7 +94,7 @@ func runOvpnAuth(keyPass string, timeout time.Duration) error {
 	if state, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
 		defer func() { _ = term.Restore(int(os.Stdin.Fd()), state) }()
 	}
-	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
+	defer ttyPassthrough(ptmx)()
 
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 4096)

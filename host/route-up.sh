@@ -25,6 +25,14 @@ else
   SUDO=""
 fi
 
+# sudo нужен для route и /etc/resolver. Спрашиваем пароль ОДИН раз и заранее:
+# ниже в цикле stderr sudo заглушён, там приглашение было бы невидимым -- юзер
+# просто смотрел бы в молчащий терминал, а скрипт падал бы с голым exit 1.
+if [[ -n "$SUDO" ]] && ! sudo -n true 2>/dev/null; then
+  echo "нужен sudo -- маршруты и /etc/resolver правятся от root:"
+  sudo -v || { echo "без sudo маршруты не поднять" >&2; exit 1; }
+fi
+
 asuser mkdir -p "$STATE"
 
 vm_ip="$(lima sh -c "ip -4 -o addr show dev lima0 | awk '{print \$4}' | cut -d/ -f1")"
@@ -65,16 +73,35 @@ vpn_dns="${CORP_DNS:-}"
 if [[ -n "$vpn_dns" ]]; then
   asuser sh -c "printf '%s\n' '$(echo $vpn_dns | tr '\n' ' ')' | tr ' ' '\n' | sed '/^$/d' > '$STATE/corp-dns'"
 fi
-if [[ -n "$vpn_dns" && -n "$CORP_DOMAINS" ]]; then
-  $SUDO mkdir -p /etc/resolver
+if [[ -z "$vpn_dns" ]]; then
+  echo "! не определил корп-DNS -- резолвер не настроен"
+elif [[ "${DNS_MODE:-primary}" == "primary" ]]; then
+  # РЕЖИМ PRIMARY (по умолчанию): корп-DNS -- основной DNS Mac. Он резолвит и
+  # корп-имена (10.x), и публичные (проверено), поэтому НИКАКИХ списков доменов
+  # не нужно -- резолвится всё само. 1.1.1.1 добавляем как fallback, чтобы при
+  # обрыве туннеля не умер весь DNS. `down` вернёт исходные серверы.
+  dev="$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
+  svc="$(networksetup -listnetworkserviceorder 2>/dev/null | awk -v d="$dev" '
+    /^\([0-9]+\)/{name=$0; sub(/^\([0-9]+\) /,"",name)}
+    /Device: /{ if ($0 ~ ("Device: " d ")")) print name }' | head -1)"
+  [[ -n "$svc" ]] || svc="Wi-Fi"
+  if [[ ! -f "$STATE/dns-primary" ]]; then
+    orig="$(networksetup -getdnsservers "$svc" 2>/dev/null | awk '/^[0-9]/{printf "%s ", $0}')"
+    asuser sh -c "printf '%s\n%s\n' '$svc' '$orig' > '$STATE/dns-primary'"
+  fi
+  $SUDO networksetup -setdnsservers "$svc" $vpn_dns 1.1.1.1
+  echo "+ основной DNS Mac -> $(echo $vpn_dns | tr '\n' ' ')(+1.1.1.1) на '$svc' -- домены перечислять не нужно"
+elif [[ -n "$CORP_DOMAINS" ]]; then
+  # РЕЖИМ RESOLVER: per-domain /etc/resolver (не трогает глобальный DNS Mac).
+  $SUDO mkdir -p /etc/resolver || { echo "не создать /etc/resolver -- нет прав root" >&2; exit 1; }
   asuser sh -c ": > '$STATE/resolver'"
   ns_block="$(for ns in $vpn_dns; do printf 'nameserver %s\n' "$ns"; done)"
-  for d in $CORP_DOMAINS; do
+  for d in $CORP_DOMAINS ${OVPN_DOMAINS:-}; do
     printf '%s\n' "$ns_block" | $SUDO tee "/etc/resolver/$d" >/dev/null
     asuser sh -c "printf '%s\n' '$d' >> '$STATE/resolver'"
     echo "+ DNS для *.$d -> $(echo $vpn_dns | tr '\n' ' ')"
   done
 else
-  echo "! не нашёл корп-DNS в /etc/resolv.conf гостя -- резолвер не настроен"
+  echo "! DNS_MODE=resolver, но CORP_DOMAINS пуст -- резолвер не настроен (или включи DNS_MODE=primary)"
 fi
 echo; echo "готово. проверь: corpvpn check  и  route -n get <корп-ip>"

@@ -23,10 +23,11 @@ fi
 
 # openvpn в detached-tmux. --dev tun1 фиксируем, чтобы не столкнуться с Cisco tun0.
 # Приватный ключ зашифрован -> openvpn спросит passphrase, его подставит corpvpn.
-# ВАЖНО: игнорируем жадный push 10.0.0.0/8 (крадёт корп-DNS/банк-подсети у Cisco)
-# и dhcp-option DNS. OpenVPN держит только свои не-10 подсети (172.x и т.п.),
-# весь 10.x (включая корп-DNS и wildberries-ресурсы) остаётся за Cisco.
+# Маршрут 10.0.0.0/8 ОСТАВЛЯЕМ: банк-подсети и корп-DNS у Cisco прописаны специфично
+# (бьют /8), а WB-only 10.x (напр. стейдж 10.168.x) ловятся именно этим /8 -> tun1.
+# Фильтруем только: redirect-gateway (не забирать default) и dhcp-option (DNS гостя
+# не трогаем -- стейдж-домены резолвим на Mac через OVPN_DNS из .env).
 tmux kill-session -t ovpn 2>/dev/null || true
 tmux new-session -d -s ovpn \
-  "openvpn --config '$CFG' --dev tun1 --auth-nocache --verb 3 --pull-filter ignore redirect-gateway --pull-filter ignore 'route 10.0.0.0' --pull-filter ignore dhcp-option"
+  "openvpn --config '$CFG' --dev tun1 --auth-nocache --verb 3 --pull-filter ignore redirect-gateway --pull-filter ignore dhcp-option"
 echo "openvpn запущен в tmux 'ovpn' на tun1"

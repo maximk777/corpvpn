@@ -75,6 +75,31 @@ func (a *authAgent) tokenValue() (string, string, bool) {
 	return a.totp.codeAt(now), "TOTP-код", true
 }
 
+// ttyPassthrough проливает клавиатуру в pty и возвращает функцию остановки.
+//
+// Читаем отдельно открытый /dev/tty, а не os.Stdin, ровно чтобы его можно было
+// закрыть: горутина на os.Stdin пережила бы аутентификацию и продолжила
+// перехватывать ввод у всего, что запускается следом в том же терминале --
+// в первую очередь у sudo в host/route-up.sh.
+func ttyPassthrough(dst io.Writer) func() {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDONLY, 0)
+	if err != nil {
+		return func() {} // нет управляющего терминала -- проливать нечего
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(dst, tty)
+	}()
+	return func() {
+		_ = tty.Close() // разблокирует Read в горутине
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	}
+}
+
 // runAuth подключается к tmux-сессии гостя и ведёт диалог аутентификации.
 func runAuth(agent *authAgent, timeout time.Duration) error {
 	cmd := exec.Command("limactl", "shell", vmName, "--",
@@ -97,7 +122,7 @@ func runAuth(agent *authAgent, timeout time.Duration) error {
 	}
 
 	// Нераспознанные приглашения набирает человек.
-	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
+	defer ttyPassthrough(ptmx)()
 
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 4096)

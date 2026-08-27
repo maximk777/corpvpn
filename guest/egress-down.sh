@@ -3,6 +3,9 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || exec sudo -E "$0" "$@"
 TUN="${EGRESS_TUN:-tun-egress}"; STATE=/run/corpvpn
 
+# Первым делом: без egress этот guard отрезал бы гостя от сети целиком.
+nft delete table inet corpvpn_guard 2>/dev/null || true
+
 systemctl stop corpvpn-tun2socks 2>/dev/null || true
 while ip -4 route show default | grep -q .; do ip route del default; done
 if [[ -f "$STATE/orig-defaults" ]]; then

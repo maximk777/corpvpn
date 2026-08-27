@@ -53,6 +53,47 @@ systemctl is-active --quiet corpvpn-tun2socks \
 while ip -4 route show default | grep -q .; do ip route del default; done
 ip route add default dev "$TUN"
 
+# --- инвариант песочницы: наружу только через $TUN -------------------------
+# vpnc-script на connect/reconnect закрепляет host-маршрут до VPN-шлюза через
+# КАЖДЫЙ не-туннельный путь -- чтобы туннель не заворачивался сам в себя. Если
+# он сработал в момент, когда egress был разобран (после сна мака, при heal),
+# он закрепит шлюз через lima0/eth0. Такой /32 специфичнее default и переживает
+# подъём egress обратно: трафик уходит с реального IP мака, корп-шлюз молча его
+# дропает, а снаружи это выглядит как "openconnect вечно висит на POST".
+orig_devs="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' "$STATE/orig-defaults" | sort -u)"
+
+for dev in $orig_devs; do
+  for dst in $(ip -4 route show dev "$dev" | awk '/ via /&&$1!="default"{print $1}'); do
+    if [[ "$dst" == "$socks_ip" || "$dst" == "$socks_ip/32" ]]; then
+      continue  # единственный легальный обход -- до самого прокси
+    fi
+    if ip route del "$dst" dev "$dev" 2>/dev/null; then
+      echo "снял утечку мимо прокси: $dst dev $dev"
+    fi
+  done
+done
+
+# Фаервол -- страховка на случай, если дыру пробьют снова: пакет мимо $TUN
+# должен отлетать сразу и громко, а не уходить в чёрную дыру на 20 секунд
+# ретрансмитов. Режем только исходные девайсы: туннели (tun0/tun1) и локальные
+# подсети не трогаем, поэтому ни VPN, ни limactl shell не страдают.
+local_nets="$(for d in $orig_devs; do ip -4 route show dev "$d" scope link | awk '$1!="default"{print $1}'; done | sort -u | paste -sd, -)"
+guard_devs="$(printf '%s\n' $orig_devs | sed 's/.*/"&"/' | paste -sd, -)"
+if [[ -n "$local_nets" && -n "$guard_devs" ]]; then
+  nft delete table inet corpvpn_guard 2>/dev/null || true
+  nft -f - <<NFT
+table inet corpvpn_guard {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    ct state established,related accept
+    ip daddr { $local_nets, 224.0.0.0/4, 255.255.255.255 } accept
+    oif { $guard_devs } reject with icmpx type admin-prohibited
+  }
+}
+NFT
+  echo "guard: наружу мимо $TUN -- reject (devs: $guard_devs)"
+fi
+
 if [[ "$PROXY_DNS" == "1" ]]; then
   # DNS уходит в туннель => через SOCKS. Требует UDP ASSOCIATE на прокси.
   [[ -f "$STATE/resolv.conf.bak" ]] || cp -aL /etc/resolv.conf "$STATE/resolv.conf.bak"

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 const (
@@ -61,6 +62,20 @@ func ifaceUp(name string) bool {
 	return err == nil
 }
 
+// stopCisco гасит openconnect так, чтобы успел отработать vpnc-script с
+// reason=disconnect: только там он снимает за собой host-маршруты до шлюза.
+// tmux kill-session этого не даёт -- процесс умирает, скрипт отключения не
+// вызывается, и маршруты остаются висеть до перезагрузки VM.
+func stopCisco() {
+	if ifaceUp(vpnTun) {
+		_, _ = guest("sudo", "pkill", "-INT", "-x", "openconnect")
+		for i := 0; i < 20 && ifaceUp(vpnTun); i++ {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	_, _ = guest("sudo", "tmux", "kill-session", "-t", tmuxName)
+}
+
 // ensureEgress поднимает tun2socks, если он ещё не поднят. Идемпотентно:
 // повторный запуск при живом туннеле ничего не ломает.
 func ensureEgress(socksAddr string, proxyDNS bool) error {
@@ -77,6 +92,13 @@ func ensureEgress(socksAddr string, proxyDNS bool) error {
 			return nil
 		}
 		fmt.Fprintln(os.Stderr, "egress несвежий (tun2socks умер?) -- пересобираю")
+		// Cisco гасим ПЕРЕД разбором egress, иначе получаем дыру мимо прокси:
+		// egress-down.sh возвращает исходные default-маршруты, а живой в этот
+		// момент openconnect на своём reconnect закрепляет через них host-маршрут
+		// до шлюза (vpnc-script, set_vpngateway_route). Такой /32 специфичнее
+		// default и переживает подъём egress обратно -- дальше часть адресов
+		// шлюза уходит с реального IP мака, который корп-шлюз молча дропает.
+		stopCisco()
 		if err := guestPassthrough("sudo", guestDir+"/guest/egress-down.sh"); err != nil {
 			return err
 		}

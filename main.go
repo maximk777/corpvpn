@@ -597,7 +597,7 @@ func cmdDown() error {
 		return nil
 	}
 	ovpnDown() // погасить OpenVPN (tun1), если поднят
-	_, _ = guest("sudo", "tmux", "kill-session", "-t", tmuxName)
+	stopCisco()
 	if err := guestPassthrough("sudo", guestDir+"/guest/egress-down.sh"); err != nil {
 		return err
 	}

@@ -22,6 +22,13 @@ const (
 // guest выполняет команду в госте и возвращает stdout.
 // limactl шумит логами в stderr -- он отделён и в результат не попадает.
 func guest(args ...string) (string, error) {
+	return guestRunner(args...)
+}
+
+// Швы для тестов: подменяются, чтобы фейкать limactl без реальной VM.
+var guestRunner = runGuest
+
+func runGuest(args ...string) (string, error) {
 	full := append([]string{"shell", vmName, "--"}, args...)
 	cmd := exec.Command("limactl", full...)
 	var stdout, stderr bytes.Buffer
@@ -35,6 +42,12 @@ func guest(args ...string) (string, error) {
 }
 
 func guestPassthrough(args ...string) error {
+	return guestPassthroughRunner(args...)
+}
+
+var guestPassthroughRunner = runGuestPassthrough
+
+func runGuestPassthrough(args ...string) error {
 	full := append([]string{"shell", vmName, "--"}, args...)
 	cmd := exec.Command("limactl", full...)
 	cmd.Stdout = os.Stdout
@@ -81,17 +94,25 @@ func stopCisco() {
 func ensureEgress(socksAddr string, proxyDNS bool) error {
 	if ifaceUp(egressTun) {
 		// Egress считаем живым, только если ВСЁ сходится: default через tun-egress,
-		// юнит на нужный прокси И tun2socks реально active. После сна интерфейс
-		// остаётся, а tun2socks дохнет -- это и есть "несвежее" состояние, из-за
-		// которого up падал (шлюз "не отвечает") и спасал только ручной down.
+		// юнит на нужный прокси, tun2socks реально active И в resolv.conf ещё
+		// bootstrap-DNS. После сна интерфейс остаётся, а tun2socks дохнет -- это
+		// и есть "несвежее" состояние, из-за которого up падал (шлюз "не
+		// отвечает") и спасал только ручной down. Отдельно vpnc-hook при каждом
+		// реконнекте Cisco подменяет resolv.conf на корп-DNS: без bootstrap
+		// (1.1.1.1/8.8.8.8 + use-vc) DNS гостя ходит мимо SOCKS и по UDP.
 		def, _ := guest("ip", "-4", "route", "show", "default")
 		unit, _ := guest("systemctl", "show", "corpvpn-tun2socks", "-p", "ExecStart", "--value")
 		active, _ := guest("systemctl", "is-active", "corpvpn-tun2socks")
+		resolv, _ := guest("cat", "/etc/resolv.conf")
 		if strings.Contains(def, egressTun) && strings.Contains(unit, socksAddr) &&
-			strings.TrimSpace(active) == "active" {
+			strings.TrimSpace(active) == "active" && resolvFresh(resolv) {
 			return nil
 		}
-		fmt.Fprintln(os.Stderr, "egress несвежий (tun2socks умер?) -- пересобираю")
+		stale := "tun2socks умер?"
+		if !resolvFresh(resolv) {
+			stale = "bootstrap resolv.conf подменён"
+		}
+		fmt.Fprintf(os.Stderr, "egress несвежий (%s) -- пересобираю\n", stale)
 		// Cisco гасим ПЕРЕД разбором egress, иначе получаем дыру мимо прокси:
 		// egress-down.sh возвращает исходные default-маршруты, а живой в этот
 		// момент openconnect на своём reconnect закрепляет через них host-маршрут
@@ -111,6 +132,24 @@ func ensureEgress(socksAddr string, proxyDNS bool) error {
 	return guestPassthrough("sudo",
 		"SOCKS_ADDR="+socksAddr, "PROXY_DNS="+dns,
 		guestDir+"/guest/egress-up.sh")
+}
+
+// resolvFresh проверяет, что в гостевом resolv.conf ещё живёт bootstrap-DNS
+// из egress-up.sh: nameserver 1.1.1.1 (8.8.8.8 лежит в том же файле) и
+// options use-vc. По полям строки, без привязки к пробелам: vpnc-hook
+// подменяет файл на корпоративные резолверы -- такой гость не «свежий».
+func resolvFresh(resolv string) bool {
+	dns, useVC := false, false
+	for _, line := range strings.Split(resolv, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "nameserver" && f[1] == "1.1.1.1" {
+			dns = true
+		}
+		if len(f) >= 2 && f[0] == "options" && f[1] == "use-vc" {
+			useVC = true
+		}
+	}
+	return dns && useVC
 }
 
 // vpnSubnets -- подсети, доступные через туннель. Именно их надо прописать

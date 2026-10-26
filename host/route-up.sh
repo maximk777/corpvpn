@@ -5,6 +5,8 @@
 # иначе root не видит VM (инстансы Lima лежат в ~/.lima вызвавшего).
 set -euo pipefail
 VM="${VM:-vpnbox}"
+# CIDR helpers from lib/ (filter_excluded/net_in_prefix) -- for CORP_EXCLUDE_SUBNETS below.
+. "$(cd "$(dirname "$0")" && pwd)/lib/netfilter.sh"
 # Корп-имена живут в нескольких доменах -- список задаётся в .env (CORP_DOMAINS).
 # macOS-резолвер матчит по домену, поэтому нужен /etc/resolver на каждый.
 CORP_DOMAINS="${CORP_DOMAINS:-${CORP_DOMAIN:-}}"
@@ -45,6 +47,16 @@ if [[ -z "$subnets" ]]; then
   subnets="$(lima sh -c 'ip -4 route show dev tun0 2>/dev/null; ip -4 route show dev tun1 2>/dev/null; true' | awk '$1!="default"{print $1}' | sort -u)"
 fi
 [[ -n "$subnets" ]] || { echo "не нашёл подсетей за tun0/tun1 -- туннель поднят?" >&2; exit 1; }
+
+# The exclude filter runs BEFORE the add loop, so a removed prefix reaches
+# neither `route -n add` nor the routes state file. Empty/unset
+# CORP_EXCLUDE_SUBNETS is a no-op (filter_excluded keeps the whole list).
+survivors="$(filter_excluded "${CORP_EXCLUDE_SUBNETS:-}" $subnets)"
+removed="$(comm -23 <(printf '%s\n' $subnets | sort -u) <(printf '%s\n' "$survivors" | sort -u))"
+for net in $removed; do
+  echo "excluded by CORP_EXCLUDE_SUBNETS: $net" >&2
+done
+subnets="$survivors"
 
 asuser sh -c ": > '$STATE/routes'"
 for net in $subnets; do

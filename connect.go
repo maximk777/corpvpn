@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"corpvpn/internal/failure"
+
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
@@ -146,7 +148,9 @@ func runAuth(agent *authAgent, timeout time.Duration) error {
 			cur := tail.String()
 
 			if reAuthFail.MatchString(cur) {
-				return fmt.Errorf("шлюз отверг учётные данные")
+				// ErrAuth lets the heal loop classify this as auth and stop
+				// after 2 attempts instead of retrying against the AD account.
+				return fmt.Errorf("%w: шлюз отверг учётные данные", failure.ErrAuth)
 			}
 			if reConnected.MatchString(cur) {
 				// Ctrl-B d -- отцепиться от tmux, оставив туннель жить.

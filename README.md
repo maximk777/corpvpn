@@ -47,8 +47,9 @@ Microsoft-аутентификаторов — в [ONBOARDING.md](ONBOARDING.md)
 - **Корп-DNS берётся правильный**: `guest/vpnc-hook.sh` перехватывает то, что
   реально пушит шлюз (`INTERNAL_IP4_DNS`), — не полагаемся на systemd-resolved,
   который его прячет. Меняется шлюз — меняется DNS, всё подхватывается само.
-- **Два VPN на разных интерфейсах** (tun0/tun1) не конфликтуют: OpenVPN'у обрезаем
-  жадный `10.0.0.0/8`, весь 10.x остаётся за Cisco. Отдельный мак-OpenVPN не нужен.
+- **Два VPN на разных интерфейсах** (tun0/tun1) не конфликтуют: `10.0.0.0/8` остаётся
+  у OpenVPN (им ловятся WB-only 10.x), фильтруются только `redirect-gateway` и
+  `dhcp-option`; чужие префиксы убирает `CORP_EXCLUDE_SUBNETS` в `.env`.
 - **`down`** — выключает watchdog, гасит оба VPN, снимает маршруты/DNS.
 - **Уведомления** macOS о смене состояния (✅ подключено / 🖕 отвалился/отключён),
   выключаются `NOTIFY=0`.
@@ -80,6 +81,7 @@ Microsoft-аутентификаторов — в [ONBOARDING.md](ONBOARDING.md)
 | `VPN_GATEWAYS`  | список Cisco-шлюзов через пробел (берётся первый живой; свитч — `corpvpn gw`) | — |
 | `CORP_DOMAINS`  | домены для `/etc/resolver`                   | — |
 | `CHECK_HOSTS`   | хосты для `corpvpn check`                    | — |
+| `CORP_EXCLUDE_SUBNETS` | префиксы чужих VPN-клиентов (напр. GitLab на мак-OpenVPN) — corpvpn их не ставит на Mac | — |
 | `OVPN_CONFIG`   | путь к `.ovpn` для OpenVPN в песочнице (пусто = не поднимать) | — |
 | `CORP_DNS`      | корп-DNS вручную (обычно ловится сам)        | (авто) |
 | `PROXY_DNS`     | `1` = DNS гостя тоже через прокси            | `1`    |
@@ -102,8 +104,8 @@ corpvpn down && corpvpn up
 `up` поднимет его на `tun1` рядом с Cisco (`tun0`): конфиг копируется в гостевой
 tmpfs на время сессии, passphrase вводится через pty (на диск не пишется), до
 сервера идём напрямую (bypass мимо SOCKS — РФ-IP ему не нужен). Маршруты обоих
-туннелей уезжают на Mac. Свой мак-OpenVPN после этого **выключи** — он не нужен и
-конфликтует за 10.x.
+туннелей уезжают на Mac. Свой мак-OpenVPN **оставь**: он обслуживает GitLab, а
+пересекающиеся с ним префиксы corpvpn исключит через `CORP_EXCLUDE_SUBNETS`.
 
 ## Проверка
 
@@ -131,10 +133,12 @@ Lima с `vmType: vz` + `vzNAT`: гостю даётся IP, видимый с х
   `127.0.0.53`, tun0 в resolvectl пуст). Поэтому берём его из `INTERNAL_IP4_DNS`
   через обёртку `guest/vpnc-hook.sh` — надёжнее любого пост-фактум определения.
   На Mac это не зависит от гостевого DNS: `/etc/resolver` бьёт прямо в корп-DNS.
-- **Wildberries-OpenVPN пушит `10.0.0.0/8`** — крадёт корп-DNS/банк-подсети у
-  Cisco. Обрезаем его `--pull-filter ignore 'route 10.0.0.0'`; весь 10.x за Cisco.
-- Отдельный **мак-OpenVPN мешает** (перехватывает `10.52.x` REJECT-маршрутом) —
-  когда всё в песочнице, его надо выключить.
+- **Wildberries-OpenVPN пушит `10.0.0.0/8`** — маршрут оставляем: WB-only 10.x
+  (напр. стейдж) ловятся именно этим /8 на tun1. В `--pull-filter` уходят только
+  `redirect-gateway` и `dhcp-option` (`guest/ovpn-up.sh`).
+- **GitLab (`gitlab.wildberries.ru`) живёт на отдельном мак-OpenVPN**, не на corpvpn:
+  выключать его не надо — пересекающиеся префиксы чужих клиентов вносятся в
+  `CORP_EXCLUDE_SUBNETS` в `.env`, и corpvpn их на Mac не ставит.
 - TOTP проверен против RFC 6238 (SHA1/256/512); `otpauth-migration://` (Google
   Authenticator) — round-trip. `go test ./...`.
 

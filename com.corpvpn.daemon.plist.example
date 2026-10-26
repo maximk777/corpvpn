@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Пользовательский LaunchAgent демона желаемого состояния (`corpvpn daemon`).
+  install.sh копирует файл в ~/Library/LaunchAgents/com.corpvpn.daemon.plist;
+  RunAtLoad + KeepAlive означают, что конвергенцией владеет launchd: старт на
+  логине, автоматический перезапуск при падении. Путь бинаря фиксированный --
+  root-owned копия из install.sh, не симлинк в репозиторий.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.corpvpn.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/corpvpn</string>
+		<string>daemon</string>
+	</array>
+	<!-- Подменяется на корень репозитория при установке (install.sh, sed):
+	     launchd стартует daemon с cwd=/, а бинарь -- root-owned копия, поэтому
+	     repoRoot() находит .env только по этой директории. -->
+	<key>WorkingDirectory</key>
+	<string>__REPO_ROOT__</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>

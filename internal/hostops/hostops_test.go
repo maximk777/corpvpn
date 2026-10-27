@@ -64,6 +64,15 @@ func gatewaylessClone(addr string) fakeResult {
 		"\n  interface: bridge100\n"}
 }
 
+// viaDefaultRoute mimics macOS `route -n get <ip>` when NO specific route
+// exists: it answers with the DEFAULT route entry (destination: default,
+// gateway = the LAN router). That is an address simply not routed yet --
+// not a foreign VPN client owning it.
+func viaDefaultRoute(addr string) fakeResult {
+	return fakeResult{stdout: "   route to: " + addr + "\ndestination: default" +
+		"\n    gateway: 192.168.176.1\n  interface: en0\n"}
+}
+
 // bankConfig is a resolver-mode config whose subnets are bank addresses
 // (/32 host prefixes), the only shape S5 hands over since the rework.
 func bankConfig(dir string) Config {
@@ -76,6 +85,7 @@ func bankConfig(dir string) Config {
 		CorpDomains:  []string{"wb-bank.ru"},
 		OVPNDomains:  []string{"stage-openvpn"},
 		CorpDNS:      []string{"10.0.0.53", "10.0.0.54"},
+		BankDomain:   "wb-bank.ru",
 		DNSMode:      "resolver",
 		IfaceGateway: "192.168.64.2",
 	}
@@ -151,11 +161,13 @@ func TestApplyNetAddsMissingRoutesAndRecordsThem(t *testing.T) {
 	// Only actually-installed prefixes are recorded, so down removes
 	// exactly what was applied.
 	assertFile(t, filepath.Join(dir, "routes"), "10.52.0.7/32\n10.60.0.9/32\n")
-	assertFile(t, filepath.Join(dir, "resolver"), "wb-bank.ru\nstage-openvpn\n")
-	// The scoped resolver file points at the local forwarder, never at the
-	// corp DNS list directly.
+	// Exactly ONE scoped resolver file -- the bank domain, recorded alone
+	// for down. The forwarder refuses names outside it, so scoping the
+	// legacy corp list (wb.ru) here would black-hole those names; the ovpn
+	// domain is a validated passthrough, never a resolver file.
+	assertFile(t, filepath.Join(dir, "resolver"), "wb-bank.ru\n")
 	assertFile(t, filepath.Join(resolverDir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
-	assertFile(t, filepath.Join(resolverDir, "stage-openvpn"), "nameserver 127.0.0.1\n")
+	assertAbsent(t, filepath.Join(resolverDir, "stage-openvpn"))
 }
 
 func TestApplyNetHealthyExistingRouteIsLeftAlone(t *testing.T) {
@@ -233,6 +245,37 @@ func TestApplyNetForeignGatewayIsContested(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "routes"), "")
 	// DNS is unaffected by a contested route.
 	assertFile(t, filepath.Join(rdir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
+	assertAbsent(t, filepath.Join(rdir, "stage-openvpn"))
+}
+
+// The default-route fallback must install the /32: destination "default"
+// means nothing specific routes the address yet (live: btg.wb-bank.ru
+// blackholed because the fallback looked like a foreign contest).
+func TestApplyNetDefaultRouteFallbackInstallsRoute(t *testing.T) {
+	dir := t.TempDir()
+	newResolverDir(t)
+	cfg := bankConfig(dir)
+	cfg.Subnets = cfg.Subnets[:1]
+	var rec fakeExec
+	rec.sequence = map[string][]fakeResult{
+		"route -n get 10.52.0.7": {viaDefaultRoute("10.52.0.7"), viaOurs("10.52.0.7")},
+	}
+	rep, err := ApplyNetReport(context.Background(), cfg, rec.exec)
+	if err != nil {
+		t.Fatalf("ApplyNetReport: %v", err)
+	}
+	if len(rep.Contested) != 0 {
+		t.Fatalf("contested = %v, want empty (the default-route fallback is not a contest)", rep.Contested)
+	}
+	wantCalls := []string{
+		"route -n get 10.52.0.7",
+		"route -n add -net 10.52.0.7/32 192.168.64.2",
+		"route -n get 10.52.0.7",
+	}
+	if !slices.Equal(rec.calls, wantCalls) {
+		t.Fatalf("exec calls = %v, want %v", rec.calls, wantCalls)
+	}
+	assertFile(t, filepath.Join(dir, "routes"), "10.52.0.7/32\n")
 }
 
 func TestApplyNetVerifyAfterAddFailsOnWrongGateway(t *testing.T) {
@@ -274,11 +317,11 @@ func TestApplyNetWritesResolverFileRegardlessOfLegacyMode(t *testing.T) {
 	assertFile(t, filepath.Join(rdir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
 }
 
-func TestApplyNetResolverModeSkipsWithoutCorpDomains(t *testing.T) {
+func TestApplyNetSkipsResolverWithoutBankDomain(t *testing.T) {
 	dir := t.TempDir()
 	rdir := newResolverDir(t)
 	cfg := bankConfig(dir)
-	cfg.CorpDomains = nil
+	cfg.BankDomain = "" // no bank domain known: no scoped file to write
 	var rec fakeExec
 	rec.sequence = map[string][]fakeResult{
 		"route -n get 10.52.0.7": {noRoute, viaOurs("10.52.0.7")},
@@ -307,6 +350,7 @@ func TestApplyNetInvalidConfigRejectedBeforeExec(t *testing.T) {
 	}{
 		{"bad corp domain", func(c *Config) { c.CorpDomains = []string{"bad_domain"} }},
 		{"bad ovpn domain", func(c *Config) { c.OVPNDomains = []string{"a..b"} }},
+		{"bad bank domain", func(c *Config) { c.BankDomain = "bad_domain" }},
 		{"ipv6 prefix", func(c *Config) {
 			c.Subnets = append(c.Subnets, netip.MustParsePrefix("2001:db8::/32"))
 		}},
@@ -357,10 +401,9 @@ func TestRemoveNetUndoesRecordedState(t *testing.T) {
 	dir := t.TempDir()
 	rdir := newResolverDir(t)
 	writeFile(t, filepath.Join(dir, "routes"), "10.52.0.7/32\n10.60.0.9/32\n")
-	writeFile(t, filepath.Join(dir, "resolver"), "wb-bank.ru\nstage-openvpn\n")
+	writeFile(t, filepath.Join(dir, "resolver"), "wb-bank.ru\n")
 	writeFile(t, filepath.Join(dir, "dns-primary"), "Wi-Fi\n8.8.8.8 1.0.0.1\n")
 	writeFile(t, filepath.Join(rdir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
-	writeFile(t, filepath.Join(rdir, "stage-openvpn"), "nameserver 127.0.0.1\n")
 
 	var rec fakeExec
 	if err := RemoveNet(context.Background(), dir, rec.exec); err != nil {
@@ -378,7 +421,28 @@ func TestRemoveNetUndoesRecordedState(t *testing.T) {
 	assertAbsent(t, filepath.Join(dir, "resolver"))
 	assertAbsent(t, filepath.Join(dir, "dns-primary"))
 	assertAbsent(t, filepath.Join(rdir, "wb-bank.ru"))
-	assertAbsent(t, filepath.Join(rdir, "stage-openvpn"))
+}
+
+// Up and down must agree on the resolver state: the single bank-domain file
+// applyResolverDNS records is exactly what RemoveNet removes.
+func TestApplyThenRemoveResolverRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	rdir := newResolverDir(t)
+	cfg := bankConfig(dir)
+	cfg.Subnets = cfg.Subnets[:1] // route already healthy: no route mutations
+	var rec fakeExec
+	rec.results = map[string]fakeResult{
+		"route -n get 10.52.0.7": viaOurs("10.52.0.7"),
+	}
+	if _, err := ApplyNetReport(context.Background(), cfg, rec.exec); err != nil {
+		t.Fatalf("ApplyNetReport: %v", err)
+	}
+	assertFile(t, filepath.Join(rdir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
+	if err := RemoveNet(context.Background(), dir, rec.exec); err != nil {
+		t.Fatalf("RemoveNet: %v", err)
+	}
+	assertAbsent(t, filepath.Join(rdir, "wb-bank.ru"))
+	assertAbsent(t, filepath.Join(dir, "resolver"))
 }
 
 func TestRemoveNetEmptyOriginalsSetsEmpty(t *testing.T) {

@@ -42,9 +42,10 @@ func execHost(ctx context.Context, runExec execFunc, name string, args ...string
 type Config struct {
 	StateDir     string
 	Subnets      []netip.Prefix // bank addresses as /32 host prefixes, exclusion-filtered
-	CorpDomains  []string       // scoped resolver domains
-	OVPNDomains  []string       // appended to the resolver set
+	CorpDomains  []string       // legacy passthrough list, validated only -- the resolver is NOT scoped per these domains
+	OVPNDomains  []string       // same: validated only, never a resolver file
 	CorpDNS      []string       // validated for the caller; resolver files point at the forwarder instead
+	BankDomain   string         // the ONE scoped resolver domain (BANK_DOMAIN): the forwarder serves only bank names
 	DNSMode      string         // legacy: still set by the root-net-up caller, ignored -- the scoped resolver file is the only DNS behavior
 	IfaceGateway string         // Lima VM gateway address for `route -n add`
 }
@@ -80,6 +81,14 @@ func (c Config) validate() error {
 			return fmt.Errorf("hostops: ovpn domain: %w", err)
 		}
 	}
+	// The bank domain becomes a file name under resolverDir and lands in the
+	// resolver state file RemoveNet re-parses strictly -- validate it here so
+	// a malformed value dies before any mutation.
+	if c.BankDomain != "" {
+		if err := netutil.ParseDomainStrict(c.BankDomain); err != nil {
+			return fmt.Errorf("hostops: bank domain: %w", err)
+		}
+	}
 	gw, err := netip.ParseAddr(c.IfaceGateway)
 	if err != nil {
 		return fmt.Errorf("hostops: gateway %q: %w", c.IfaceGateway, err)
@@ -111,8 +120,11 @@ func ApplyNet(ctx context.Context, cfg Config, runExec execFunc) error {
 // The route loop works per bank address: `route -n get` decides before any
 // mutation. A route already pointing at the VM gateway is left alone; a
 // cloned gatewayless host route is deleted and re-added via the gateway; a
-// foreign gateway is never fought -- the address is reported as contested and
-// skipped. Only actually-installed prefixes are recorded.
+// `destination: default` fallback (macOS answers with the default-route
+// entry when nothing specific exists) is not routed yet and gets the add; a
+// specific route via a foreign gateway is never fought -- the address is
+// reported as contested and skipped. Only actually-installed prefixes are
+// recorded.
 func ApplyNetReport(ctx context.Context, cfg Config, runExec execFunc) (NetReport, error) {
 	if err := cfg.validate(); err != nil {
 		return NetReport{}, err
@@ -135,9 +147,10 @@ func ApplyNetReport(ctx context.Context, cfg Config, runExec execFunc) (NetRepor
 	for _, p := range cfg.Subnets {
 		addr := p.Addr().String()
 		out, gerr := execHost(ctx, runExec, "route", "-n", "get", addr)
-		var gw string
+		var gw, dest string
 		if gerr == nil {
 			gw = routeGatewayOf(out)
+			dest = routeDestinationOf(out)
 		}
 		switch {
 		case gerr == nil && gw == cfg.IfaceGateway:
@@ -151,8 +164,15 @@ func ApplyNetReport(ctx context.Context, cfg Config, runExec execFunc) (NetRepor
 				errs = append(errs, fmt.Errorf("route delete %s: %w", addr, err))
 				continue
 			}
+		case gerr == nil && dest == "default":
+			// macOS `route -n get` answers with the DEFAULT route entry when
+			// no specific route exists (gateway = the LAN router): the
+			// address is simply not routed yet, not owned by another VPN
+			// client -- add it (live 2026-10-27: btg.wb-bank.ru was skipped
+			// as contested here).
 		case gerr == nil:
-			// A foreign VPN client owns the route: never fight another world.
+			// A specific route via a foreign gateway: another VPN client
+			// owns it -- never fight another world.
 			report.Contested = append(report.Contested, addr)
 			continue
 		}
@@ -194,33 +214,43 @@ func routeGatewayOf(out string) string {
 	return ""
 }
 
-// applyResolverDNS writes one /etc/resolver file per domain (corp list
-// first, OVPN domains appended), all pointing at the local DNS forwarder on
-// 127.0.0.1 -- the forwarder forwards bank names to corp DNS itself. Each
-// domain is recorded into the resolver state file so RemoveNet removes
-// exactly those files.
+// routeDestinationOf extracts the "destination: ..." line from `route -n get`
+// output. macOS answers "default" when no specific route exists -- the
+// matched route is the default path, not one owning the queried address.
+func routeDestinationOf(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "destination:" {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// applyResolverDNS writes exactly ONE /etc/resolver file: the bank domain,
+// pointing at the local DNS forwarder on 127.0.0.1. The forwarder serves
+// only names under the bank domain, so scoping any other domain here (a
+// legacy CORP_DOMAINS entry like wb.ru) would black-hole its names -- the
+// resolver admits the bank domain and nothing else. The domain is recorded
+// into the resolver state file so RemoveNet removes exactly what was
+// written.
 func applyResolverDNS(cfg Config) []error {
-	if len(cfg.CorpDomains) == 0 {
+	if cfg.BankDomain == "" {
 		return nil
 	}
-	var errs []error
 	if err := os.MkdirAll(resolverDir, 0o755); err != nil {
 		return []error{fmt.Errorf("hostops: %s: %w", resolverDir, err)}
 	}
 	const block = "nameserver 127.0.0.1\n"
+	if err := os.WriteFile(filepath.Join(resolverDir, cfg.BankDomain), []byte(block), 0o644); err != nil {
+		return []error{fmt.Errorf("resolver %s: %w", cfg.BankDomain, err)}
+	}
 	state, err := os.Create(filepath.Join(cfg.StateDir, "resolver"))
 	if err != nil {
 		return []error{fmt.Errorf("hostops: resolver state: %w", err)}
 	}
 	defer state.Close()
-	for _, d := range append(append([]string{}, cfg.CorpDomains...), cfg.OVPNDomains...) {
-		if err := os.WriteFile(filepath.Join(resolverDir, d), []byte(block), 0o644); err != nil {
-			errs = append(errs, fmt.Errorf("resolver %s: %w", d, err))
-			continue
-		}
-		fmt.Fprintln(state, d)
-	}
-	return errs
+	fmt.Fprintln(state, cfg.BankDomain)
+	return nil
 }
 
 // RemoveNet undoes everything recorded in the state files: deletes recorded

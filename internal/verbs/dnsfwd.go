@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	osignal "os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,21 +20,29 @@ import (
 var downGrace = 5 * time.Second
 
 // spawn is the exec seam: starts selfPath with args detached from the
-// caller's process group and returns the child pid. Default re-executes
-// the installed binary; tests inject a fake.
-var spawn = func(selfPath string, args ...string) (int, error) {
+// caller's process group and returns the child pid. The child's
+// stdout/stderr are redirected to logPath (created, appended) instead of
+// inheriting the caller's pipes: a forwarder outliving the caller would
+// keep the inherited pipe write end open forever and block the caller's
+// Cmd.Wait. Default re-executes the installed binary; tests inject a fake.
+var spawn = func(logPath, selfPath string, args ...string) (int, error) {
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return 0, fmt.Errorf("spawn %s: open log %s: %w", selfPath, logPath, err)
+	}
 	cmd := exec.Command(selfPath, args...)
 	// Own process group: the forwarder must survive the daemon until
 	// Down explicitly signals it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// The daemon's own stdout/stderr are redirected to its log file by
-	// its launcher, so the child inherits them rather than opening a
-	// second log path.
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
+		logFile.Close()
 		return 0, fmt.Errorf("spawn %s: %w", selfPath, err)
 	}
+	// The child keeps its own dup of the fd; the parent's copy must
+	// close or the log (and any descriptors derived from it) leak here.
+	logFile.Close()
 	return cmd.Process.Pid, nil
 }
 
@@ -52,20 +61,36 @@ func reap(pid int) {
 
 // DNSFwdUp re-executes the installed binary as `corpvpn dnsfwd-run`
 // (root, background) and writes the child pid to the pidfile. Idempotent:
-// a live pid short-circuits. Returns the child pid.
+// short-circuits only when the recorded child is live AND was spawned with
+// the same domain/upstream (pidfile v2); a live child with different args,
+// or a legacy pid-only pidfile whose args are unknown, is stopped first so
+// a rotated upstream never keeps being served by the old child.
+// Returns the child pid.
 func DNSFwdUp(selfPath, bankDomain, upstream, pidPath string) (int, error) {
-	if pid, err := readPid(pidPath); err == nil && pid > 0 {
-		if alive, perr := probePid(pid); perr == nil && alive {
-			return pid, nil
+	if e, err := readPidEntry(pidPath); err == nil && e.pid > 0 {
+		alive, perr := probePid(e.pid)
+		if perr == nil && alive {
+			if e.domain == bankDomain && e.upstream == upstream {
+				return e.pid, nil
+			}
+			// Reuse the Down kill path: SIGTERM, grace, SIGKILL.
+			if err := stopChild(e.pid); err != nil {
+				return 0, err
+			}
+			os.Remove(pidPath)
 		}
 	}
 	// Child argv: the main dispatch runs `dnsfwd-run` with the bank
-	// domain and upstream as the following arguments.
-	pid, err := spawn(selfPath, "dnsfwd-run", bankDomain, upstream)
+	// domain and upstream as the following arguments. The child's log
+	// lives next to the pidfile, derived here so the public signature
+	// stays unchanged for callers.
+	logPath := filepath.Join(filepath.Dir(pidPath), "dnsfwd.log")
+	pid, err := spawn(logPath, selfPath, "dnsfwd-run", bankDomain, upstream)
 	if err != nil {
 		return 0, fmt.Errorf("dnsfwd: %w", err)
 	}
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
+	entry := fmt.Sprintf("%d %s %s\n", pid, bankDomain, upstream)
+	if err := os.WriteFile(pidPath, []byte(entry), 0o600); err != nil {
 		// Without the pidfile Down could never find this child.
 		_ = signal(pid, syscall.SIGKILL)
 		reap(pid)
@@ -74,8 +99,8 @@ func DNSFwdUp(selfPath, bankDomain, upstream, pidPath string) (int, error) {
 	return pid, nil
 }
 
-// DNSFwdDown stops the pid from the pidfile (SIGTERM, 5s grace, SIGKILL),
-// removes the pidfile. Missing pidfile or dead pid is a no-op.
+// DNSFwdDown stops the child recorded in the pidfile (SIGTERM, 5s grace,
+// SIGKILL), removes the pidfile. Missing pidfile or dead pid is a no-op.
 func DNSFwdDown(pidPath string) error {
 	b, err := os.ReadFile(pidPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -84,33 +109,42 @@ func DNSFwdDown(pidPath string) error {
 	if err != nil {
 		return fmt.Errorf("dnsfwd: read pidfile: %w", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		// A pidfile only becomes corrupt when a writer crashed mid-write;
-		// there is nothing to signal.
+	e, ok := parsePidEntry(string(b))
+	if !ok {
+		// A pidfile only becomes unparseable when a writer crashed
+		// mid-write; there is nothing to signal.
 		os.Remove(pidPath)
 		return nil
 	}
+	if err := stopChild(e.pid); err != nil {
+		return err
+	}
+	os.Remove(pidPath)
+	return nil
+}
 
+// stopChild terminates a forwarder child: SIGTERM, downGrace wait,
+// SIGKILL, then reap. Shared by Up (stale args) and Down.
+func stopChild(pid int) error {
 	alive, err := probePid(pid)
 	if err != nil {
 		return err
 	}
-	if alive {
-		if err := signal(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("dnsfwd: TERM pid %d: %w", pid, err)
+	if !alive {
+		return nil
+	}
+	if err := signal(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("dnsfwd: TERM pid %d: %w", pid, err)
+	}
+	if !waitPidGone(pid, downGrace) {
+		if err := signal(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("dnsfwd: KILL pid %d: %w", pid, err)
 		}
 		if !waitPidGone(pid, downGrace) {
-			if err := signal(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-				return fmt.Errorf("dnsfwd: KILL pid %d: %w", pid, err)
-			}
-			if !waitPidGone(pid, downGrace) {
-				return fmt.Errorf("dnsfwd: pid %d survived SIGKILL", pid)
-			}
+			return fmt.Errorf("dnsfwd: pid %d survived SIGKILL", pid)
 		}
-		reap(pid)
 	}
-	os.Remove(pidPath)
+	reap(pid)
 	return nil
 }
 
@@ -124,13 +158,44 @@ func DNSFwdRun(bankDomain, upstream string) error {
 	return f.ServeUDP(ctx, "127.0.0.1:53")
 }
 
-// readPid returns the decimal pid stored in the pidfile.
-func readPid(pidPath string) (int, error) {
+// pidEntry is the parsed pidfile content. A legacy pid-only line parses
+// with empty domain/upstream: the child's args are unknown, so Up must not
+// short-circuit on it.
+type pidEntry struct {
+	pid      int
+	domain   string
+	upstream string
+}
+
+// parsePidEntry parses "<pid> <bankDomain> <upstream>" (v2) or "<pid>"
+// (legacy). The second return is false when no pid can be read at all.
+func parsePidEntry(s string) (pidEntry, bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return pidEntry{}, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return pidEntry{}, false
+	}
+	e := pidEntry{pid: pid}
+	if len(fields) >= 3 {
+		e.domain, e.upstream = fields[1], fields[2]
+	}
+	return e, true
+}
+
+// readPidEntry reads and parses the pidfile; read and parse errors propagate.
+func readPidEntry(pidPath string) (pidEntry, error) {
 	b, err := os.ReadFile(pidPath)
 	if err != nil {
-		return 0, err
+		return pidEntry{}, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(b)))
+	e, ok := parsePidEntry(string(b))
+	if !ok {
+		return pidEntry{}, errors.New("dnsfwd: unparseable pidfile")
+	}
+	return e, nil
 }
 
 // probePid reports whether pid is running. A dead pid is ESRCH; EPERM

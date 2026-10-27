@@ -2,10 +2,12 @@ package verbs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -14,16 +16,16 @@ import (
 // installSeams swaps the spawn/signal seams and the down grace for fakes,
 // restoring the originals on cleanup. A nil spawnFn or sigFn fails the test
 // if the code under test dares to call it.
-func installSeams(t *testing.T, spawnFn func(string, ...string) (int, error), sigFn func(int, os.Signal) error, grace time.Duration) {
+func installSeams(t *testing.T, spawnFn func(string, string, ...string) (int, error), sigFn func(int, os.Signal) error, grace time.Duration) {
 	t.Helper()
 	oldSpawn, oldSignal, oldGrace := spawn, signal, downGrace
 	t.Cleanup(func() { spawn, signal, downGrace = oldSpawn, oldSignal, oldGrace })
-	spawn = func(selfPath string, args ...string) (int, error) {
+	spawn = func(logPath, selfPath string, args ...string) (int, error) {
 		if spawnFn == nil {
-			t.Errorf("unexpected spawn %q %v", selfPath, args)
+			t.Errorf("unexpected spawn %q %q %v", logPath, selfPath, args)
 			return 0, errors.New("unexpected spawn")
 		}
-		return spawnFn(selfPath, args...)
+		return spawnFn(logPath, selfPath, args...)
 	}
 	signal = func(pid int, sig os.Signal) error {
 		if sigFn == nil {
@@ -42,12 +44,21 @@ func writePidFile(t *testing.T, path string, pid int) {
 	}
 }
 
+// writePidEntry writes the v2 pidfile format "<pid> <bankDomain> <upstream>",
+// which Up uses to detect a live child running with stale args.
+func writePidEntry(t *testing.T, path string, pid int, bankDomain, upstream string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d %s %s\n", pid, bankDomain, upstream)), 0o600); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+}
+
 func TestDNSFwdUp(t *testing.T) {
 	t.Run("up writes pidfile and returns pid", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
 		var gotSelf string
 		var gotArgs []string
-		installSeams(t, func(selfPath string, args ...string) (int, error) {
+		installSeams(t, func(_, selfPath string, args ...string) (int, error) {
 			gotSelf = selfPath
 			gotArgs = args
 			return 4242, nil
@@ -70,15 +81,15 @@ func TestDNSFwdUp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read pidfile: %v", err)
 		}
-		if got, want := string(b), "4242\n"; got != want {
+		if got, want := string(b), "4242 wb-bank.ru 10.108.67.4:53\n"; got != want {
 			t.Errorf("pidfile = %q, want %q", got, want)
 		}
 	})
 
-	t.Run("up with live pid is a no-op returning same pid", func(t *testing.T) {
+	t.Run("up with live pid and matching args is a no-op returning same pid", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
-		writePidFile(t, pidPath, 5150)
-		installSeams(t, func(string, ...string) (int, error) {
+		writePidEntry(t, pidPath, 5150, "wb-bank.ru", "10.108.67.4:53")
+		installSeams(t, func(string, string, ...string) (int, error) {
 			return 0, errors.New("must not spawn over a live pid")
 		}, func(pid int, sig os.Signal) error {
 			if pid != 5150 {
@@ -101,15 +112,97 @@ func TestDNSFwdUp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read pidfile: %v", err)
 		}
-		if got, want := string(b), "5150\n"; got != want {
+		if got, want := string(b), "5150 wb-bank.ru 10.108.67.4:53\n"; got != want {
 			t.Errorf("pidfile = %q, want %q untouched", got, want)
+		}
+	})
+
+	t.Run("up restarts a live pid with different upstream", func(t *testing.T) {
+		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
+		writePidEntry(t, pidPath, 5150, "wb-bank.ru", "10.108.67.1:53")
+		terminated := false
+		var spawnedArgs []string
+		installSeams(t, func(_, _ string, args ...string) (int, error) {
+			spawnedArgs = args
+			return 4242, nil
+		}, func(pid int, sig os.Signal) error {
+			if isSignalZero(sig) {
+				if pid != 5150 {
+					t.Errorf("probed pid %d, want 5150", pid)
+				}
+				if terminated {
+					return syscall.ESRCH
+				}
+				return nil // old child alive until TERM lands
+			}
+			if pid != 5150 || sig != syscall.SIGTERM {
+				t.Errorf("signal %d %v, want SIGTERM to 5150", pid, sig)
+			}
+			terminated = true
+			return nil
+		}, 30*time.Millisecond)
+
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !terminated {
+			t.Errorf("stale child 5150 was not terminated")
+		}
+		if pid != 4242 {
+			t.Fatalf("pid = %d, want 4242", pid)
+		}
+		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"}; !reflect.DeepEqual(spawnedArgs, want) {
+			t.Errorf("spawn args = %v, want %v", spawnedArgs, want)
+		}
+		b, _ := os.ReadFile(pidPath)
+		if got, want := string(b), "4242 wb-bank.ru 10.108.67.4:53\n"; got != want {
+			t.Errorf("pidfile = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("up restarts a live pid recorded in a legacy pid-only pidfile", func(t *testing.T) {
+		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
+		writePidFile(t, pidPath, 5150)
+		var spawnedArgs []string
+		terminated := false
+		installSeams(t, func(_, _ string, args ...string) (int, error) {
+			spawnedArgs = args
+			return 4242, nil
+		}, func(pid int, sig os.Signal) error {
+			if isSignalZero(sig) {
+				if terminated {
+					return syscall.ESRCH
+				}
+				return nil // alive: args unknown, must not short-circuit
+			}
+			if pid != 5150 || sig != syscall.SIGTERM {
+				t.Errorf("signal %d %v, want SIGTERM to 5150", pid, sig)
+			}
+			terminated = true
+			return syscall.ESRCH
+		}, 30*time.Millisecond)
+
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pid != 4242 {
+			t.Fatalf("pid = %d, want 4242", pid)
+		}
+		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"}; !reflect.DeepEqual(spawnedArgs, want) {
+			t.Errorf("spawn args = %v, want %v", spawnedArgs, want)
+		}
+		b, _ := os.ReadFile(pidPath)
+		if got, want := string(b), "4242 wb-bank.ru 10.108.67.4:53\n"; got != want {
+			t.Errorf("pidfile = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("up respawns over a stale pidfile", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
 		writePidFile(t, pidPath, 999)
-		installSeams(t, func(string, ...string) (int, error) {
+		installSeams(t, func(string, string, ...string) (int, error) {
 			return 4242, nil
 		}, func(int, os.Signal) error {
 			return syscall.ESRCH // dead
@@ -123,7 +216,7 @@ func TestDNSFwdUp(t *testing.T) {
 			t.Fatalf("pid = %d, want 4242", pid)
 		}
 		b, _ := os.ReadFile(pidPath)
-		if got, want := string(b), "4242\n"; got != want {
+		if got, want := string(b), "4242 wb-bank.ru 10.108.67.4:53\n"; got != want {
 			t.Errorf("pidfile = %q, want %q", got, want)
 		}
 	})
@@ -162,6 +255,34 @@ func TestDNSFwdDown(t *testing.T) {
 		}
 		if len(sigs) != 1 || sigs[0] != syscall.SIGTERM {
 			t.Errorf("signals = %v, want exactly one SIGTERM", sigs)
+		}
+		if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("pidfile still present: %v", err)
+		}
+	})
+
+	t.Run("down parses the v2 pidfile format", func(t *testing.T) {
+		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
+		writePidEntry(t, pidPath, 777, "wb-bank.ru", "10.108.67.4:53")
+		terminated := false
+		installSeams(t, nil, func(pid int, sig os.Signal) error {
+			if pid != 777 {
+				t.Errorf("signalled pid %d, want 777", pid)
+			}
+			if isSignalZero(sig) {
+				if terminated {
+					return syscall.ESRCH
+				}
+				return nil // alive until TERM lands
+			}
+			if sig == syscall.SIGTERM {
+				terminated = true
+			}
+			return nil
+		}, 30*time.Millisecond)
+
+		if err := DNSFwdDown(pidPath); err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
 		if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("pidfile still present: %v", err)
@@ -241,4 +362,34 @@ func TestDNSFwdDown(t *testing.T) {
 			t.Errorf("pidfile still present: %v", err)
 		}
 	})
+}
+
+// TestSpawnReal runs the unfaked spawn against /bin/echo to pin the
+// log-file contract: the child's output must land in logPath (created on
+// first spawn, appended on later ones), never the caller's pipes. The
+// no-hang property — a long-lived child must not keep the caller's
+// Cmd.Wait blocked — is structural here: the child's descriptors are the
+// log file, not inherited pipes.
+func TestSpawnRealWritesChildOutputToLogFile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "dnsfwd.log")
+	if _, err := spawn(logPath, "/bin/echo", "first-run"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	// A second spawn against the same log proves append mode.
+	if _, err := spawn(logPath, "/bin/echo", "second-run"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	// spawn returns right after Start; poll briefly for the children's
+	// output to land in the file.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b, err := os.ReadFile(logPath)
+		if err == nil && strings.Contains(string(b), "first-run") && strings.Contains(string(b), "second-run") {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("log %s = %q (read err %v), want both runs appended", logPath, b, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

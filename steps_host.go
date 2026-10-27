@@ -22,6 +22,7 @@ import (
 	"corpvpn/internal/netutil"
 	"corpvpn/internal/probe"
 	"corpvpn/internal/reconcile"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/term"
 )
 
@@ -46,15 +47,91 @@ type corpEnv struct {
 	OVPNDomains []string
 	CorpDNS     []string
 	CheckHost   string // bank probe host (BANK_PROBE_HOST), probed by S6
+	BankDomain  string // bank DNS scope (BANK_DOMAIN): S6's probe domain and the only /etc/resolver file
 	StateDir    string
 }
 
 // S5 route source and contested notification, package vars so tests inject
-// fakes (same pattern as the internal/verbs seams).
+// fakes (same pattern as the internal/verbs seams). limactlDefault is the
+// assembly's fallback runner: healBuildSteps hands assembleCorpEnv a zero
+// stepDeps{} and stepsCore's default lands only later, so the CORP_DNS
+// guest hunt must resolve the seam itself.
 var (
 	bankAddrsFn       = defaultBankAddrs
 	contestedNotifyFn = notify
+	limactlDefault    = runLimactlExec
 )
+
+// forwarderEndpoint is the forwarder-liveness dial target: tests override
+// it to an ephemeral fake DNS server, production keeps the forwarder.
+var forwarderEndpoint = forwarderAddr + ":53"
+
+// forwarderAlive performs a REAL DNS exchange with the forwarder, bypassing
+// /etc/hosts: the Go resolver consults the hosts file BEFORE DNS, so a
+// legacy hosts entry for the probe host makes LookupHost succeed even with
+// a dead forwarder and the old resolver-based probe passed forever. Only
+// the forwarder's own datagram counts: Success rcode with at least one
+// answer; NXDOMAIN, refusal, timeout, truncation or garbage is "does not
+// answer" and fails S5's verify, so the cascade restarts the process. The
+// 3s bound lives on the socket deadline; ctx is checked around the
+// exchange. The dns-fwd start is part of S5, so a dead forwarder must fail
+// S5's verify -- the reconcile cascade then re-ensures S5 and its dns-fwd
+// up restarts the process -- instead of surfacing only on S6, which has no
+// Ensure of its own.
+var forwarderAlive = func(ctx context.Context, env corpEnv) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// CheckHost is validated by loadBankConfig (lowercase labels, <=253
+	// chars), so the FQDN form always fits a dnsmessage.Name.
+	q := dnsmessage.Message{
+		Header: dnsmessage.Header{RecursionDesired: true},
+		Questions: []dnsmessage.Question{{
+			Name:  dnsmessage.MustNewName(strings.TrimSuffix(env.CheckHost, ".") + "."),
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.ClassINET,
+		}},
+	}
+	buf, err := q.Pack()
+	if err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	conn, err := net.Dial("udp", forwarderEndpoint)
+	if err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	// Fresh connected socket per query: the first datagram back belongs to
+	// this query (the same trick internal/dnsfwd uses against upstream).
+	rbuf := make([]byte, 1500)
+	n, err := conn.Read(rbuf)
+	if err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	var ans dnsmessage.Message
+	if err := ans.Unpack(rbuf[:n]); err != nil {
+		return fmt.Errorf("forwarder %s does not answer: %w", forwarderEndpoint, err)
+	}
+	if ans.Truncated {
+		return fmt.Errorf("forwarder %s does not answer: %s: answer truncated", forwarderEndpoint, env.CheckHost)
+	}
+	if ans.RCode != dnsmessage.RCodeSuccess {
+		return fmt.Errorf("forwarder %s does not answer: %s: rcode %s", forwarderEndpoint, env.CheckHost, ans.RCode)
+	}
+	if len(ans.Answers) == 0 {
+		return fmt.Errorf("forwarder %s does not answer: %s: no answer records", forwarderEndpoint, env.CheckHost)
+	}
+	return nil
+}
 
 // assembleCorpEnv builds corpEnv via the existing .env loader. Invalid
 // CORP_EXCLUDE_SUBNETS entries abort before any mutation happens. Runs
@@ -63,6 +140,12 @@ var (
 func assembleCorpEnv(d stepDeps) (*corpEnv, error) {
 	if d.vmIP == nil {
 		d.vmIP = vmIP
+	}
+	// healBuildSteps passes a zero stepDeps{} and stepsCore applies the
+	// production runner only later, so the CORP_DNS guest hunt below would
+	// call a nil func without this fallback.
+	if d.runLimactl == nil {
+		d.runLimactl = limactlDefault
 	}
 	// The S6 probe host is the bank config contract (BANK_PROBE_HOST,
 	// default btg.wb-bank.ru); CHECK_HOSTS is a dead contract, not read.
@@ -75,6 +158,7 @@ func assembleCorpEnv(d stepDeps) (*corpEnv, error) {
 		OVPNDomains: strings.Fields(os.Getenv("OVPN_DOMAINS")),
 		CorpDNS:     strings.Fields(os.Getenv("CORP_DNS")),
 		CheckHost:   bc.BankProbeHost,
+		BankDomain:  bc.BankDomain,
 		StateDir:    stateDir(),
 	}
 	for _, s := range strings.Fields(os.Getenv("CORP_EXCLUDE_SUBNETS")) {
@@ -93,9 +177,7 @@ func assembleCorpEnv(d stepDeps) (*corpEnv, error) {
 	// -> last-good cache. The forwarder's upstream is fed from here until the
 	// daemon owns the wiring.
 	if len(env.CorpDNS) == 0 {
-		env.CorpDNS = corpDNSFromGuest(context.Background(), func(ctx context.Context, args ...string) (string, error) {
-			return d.runLimactl(ctx, append([]string{"shell", vmName, "--"}, args...)...)
-		})
+		env.CorpDNS = corpDNSFromGuest(context.Background(), guestDNSRunner(d.runLimactl))
 		if len(env.CorpDNS) > 0 {
 			fmt.Println("корп-DNS ловлю с шлюза:", strings.Join(env.CorpDNS, " "))
 		}
@@ -205,6 +287,14 @@ func corpDNSFromGuest(ctx context.Context, runLimactl func(context.Context, ...s
 	return strings.Fields(out)
 }
 
+// guestDNSRunner adapts a limactl runner for corpDNSFromGuest: the awk probe
+// must run inside the guest ("shell", vmName, "--").
+func guestDNSRunner(runLimactl func(context.Context, ...string) (string, error)) func(context.Context, ...string) (string, error) {
+	return func(ctx context.Context, args ...string) (string, error) {
+		return runLimactl(ctx, append([]string{"shell", vmName, "--"}, args...)...)
+	}
+}
+
 func corpDNSFromCache(dir string) []string {
 	b, err := os.ReadFile(filepath.Join(dir, "corp-dns"))
 	if err != nil {
@@ -291,6 +381,12 @@ func stepsHost(d stepDeps, env *corpEnv) []reconcile.Step {
 	if d.runHost == nil {
 		d.runHost = hostops.RealExec
 	}
+	// buildSteps hands the same deps value to stepsCore and stepsHost, and
+	// stepsCore's default lands on its own copy -- S5's guest DNS refresh
+	// must resolve the seam itself, exactly like the assembly does.
+	if d.runLimactl == nil {
+		d.runLimactl = limactlDefault
+	}
 	if d.runSudo == nil {
 		d.runSudo = sudoExec
 	}
@@ -310,6 +406,16 @@ func stepsHost(d stepDeps, env *corpEnv) []reconcile.Step {
 		{
 			Name: stepHost,
 			Ensure: func(ctx context.Context) error {
+				// Fresh upstream: S5 runs after S4 (tunnel up, vpnc-hook has
+				// parked the gateway-pushed DNS in /run/corpvpn/vpn-dns),
+				// while env.CorpDNS may be stale cache from an older session.
+				// Refreshing here sends the working servers to root-net-up
+				// and root-dns-fwd through the same environ and keeps the
+				// cache file current.
+				if fresh := corpDNSFromGuest(ctx, guestDNSRunner(d.runLimactl)); len(fresh) > 0 && !slices.Equal(fresh, env.CorpDNS) {
+					env.CorpDNS = fresh
+					saveCorpDNSCache(env.StateDir, fresh)
+				}
 				addrs, err := bankAddrsFn(ctx, *env)
 				if err != nil {
 					return stepWrap(stepHost, err)
@@ -367,7 +473,10 @@ func stepsHost(d stepDeps, env *corpEnv) []reconcile.Step {
 			// Ensure must stay non-nil -- reconcile.RepairFrom calls it.
 			Ensure: func(context.Context) error { return nil },
 			Verify: func(ctx context.Context) error {
-				return stepWrap(stepProbe, d.check(ctx, env.CorpDomains[0], env.CheckHost))
+				// The probe domain is the bank domain: legacy CORP_DOMAINS
+				// entries are not served by the scoped forwarder and would
+				// resolve to NXDOMAIN.
+				return stepWrap(stepProbe, d.check(ctx, env.BankDomain, env.CheckHost))
 			},
 		},
 	}
@@ -377,7 +486,9 @@ func stepsHost(d stepDeps, env *corpEnv) []reconcile.Step {
 // must resolve via the Lima gateway -- a missing route or a gatewayless
 // clone fails and sends the reconcile back to Ensure; an address a foreign
 // gateway owns is contested: notified once per episode, never fought, never
-// an error. Every scoped resolver file must carry a nameserver line.
+// an error. The scoped resolver file (the bank domain, the only one) must
+// carry a nameserver line, and the forwarder must answer: a dead forwarder
+// fails here so the cascade re-ensures S5 and restarts it.
 func verifyHostNet(ctx context.Context, d stepDeps, env *corpEnv) error {
 	addrs, err := bankAddrsFn(ctx, *env)
 	if err != nil {
@@ -388,26 +499,32 @@ func verifyHostNet(ctx context.Context, d stepDeps, env *corpEnv) error {
 		if err != nil {
 			return fmt.Errorf("route to %s: %w", a, err)
 		}
-		switch gw := routeGetGateway(out); gw {
-		case env.Gateway:
+		switch gw := routeGetGateway(out); {
+		case gw == env.Gateway:
 			resetContested(a.String())
-		case "":
+		case gw == "":
 			return fmt.Errorf("route to %s is a gatewayless clone, want gateway %s", a, env.Gateway)
+		case routeGetDestination(out) == "default":
+			// macOS `route -n get` answers with the DEFAULT route entry when
+			// no specific route exists (gateway = the LAN router): the
+			// address is missing, not contested -- fail so the cascade
+			// re-ensures S5 and installs it.
+			return fmt.Errorf("route to %s missing, want gateway %s", a, env.Gateway)
 		default:
 			notifyContested(a.String())
 			fmt.Println("занято чужим шлюзом", gw, "-- пропускаю:", a)
 		}
 	}
-	for _, dom := range env.CorpDomains {
-		b, err := os.ReadFile(filepath.Join(d.resolverDir, dom))
+	if env.BankDomain != "" {
+		b, err := os.ReadFile(filepath.Join(d.resolverDir, env.BankDomain))
 		if err != nil {
-			return fmt.Errorf("resolver file missing: %w", err)
+			return fmt.Errorf("resolver file %s missing: %w", env.BankDomain, err)
 		}
 		if !hasNameserver(b) {
-			return fmt.Errorf("resolver file %s has no nameserver line -- DNS was applied empty", dom)
+			return fmt.Errorf("resolver file %s has no nameserver line -- DNS was applied empty", env.BankDomain)
 		}
 	}
-	return nil
+	return forwarderAlive(ctx, *env)
 }
 
 // routeGetGateway extracts the gateway from `route -n get <net>` output (the
@@ -416,6 +533,19 @@ func routeGetGateway(out string) string {
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 2 && f[0] == "gateway:" {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// routeGetDestination extracts the matched destination from `route -n get`
+// output. macOS answers "default" when no specific route exists -- the
+// matched route is the default path, not one owning the queried address.
+func routeGetDestination(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "destination:" {
 			return f[1]
 		}
 	}

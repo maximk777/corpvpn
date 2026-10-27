@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"net"
 	"net/netip"
 	"os"
 	"os/user"
@@ -14,6 +16,7 @@ import (
 
 	"corpvpn/internal/hostops"
 	"corpvpn/internal/reconcile"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // sudoFake is an injectable runSudo: it records every invocation (argv and
@@ -97,7 +100,9 @@ func withBankAddrs(t *testing.T, msgs *[]string, addrs ...netip.Addr) {
 }
 
 // testCorpEnv is a corpEnv with one excluded prefix (10.20.0.0/16) that must
-// never leak past the per-address skip.
+// never leak past the per-address skip. BankDomain is deliberately distinct
+// from CorpDomains[0]: the legacy corp list is not served by the scoped
+// forwarder, so S6 and the resolver check must use the bank domain only.
 func testCorpEnv(t *testing.T) *corpEnv {
 	t.Helper()
 	return &corpEnv{
@@ -107,22 +112,54 @@ func testCorpEnv(t *testing.T) *corpEnv {
 		OVPNDomains: []string{"stage.example"},
 		CorpDNS:     []string{"10.10.0.1"},
 		CheckHost:   "wiki.corp.example",
+		BankDomain:  "bank.example",
 		StateDir:    t.TempDir(),
 	}
 }
 
-// s5HealthyDeps returns deps whose S5 verify passes: the resolver files (in a
-// temp dir standing in for /etc/resolver) are staged and route -n get for the
-// bank address resolves via the VM gateway.
+// withGuestDNS stubs the limactlDefault seam so the guest DNS probe (S5's
+// refresh and the assembly fallback) never execs the real limactl; out is
+// what the guest awk over /run/corpvpn/vpn-dns prints. Returns the recorded
+// arg lines.
+func withGuestDNS(t *testing.T, out string) *[]string {
+	t.Helper()
+	var calls []string
+	old := limactlDefault
+	limactlDefault = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return out, nil
+	}
+	t.Cleanup(func() { limactlDefault = old })
+	return &calls
+}
+
+// withForwarderAlive stubs the S5 forwarder-liveness seam so verify never
+// dials the real 127.0.0.1:53; alive is what the probe returns, and the
+// returned counter tracks how often verify consulted it.
+func withForwarderAlive(t *testing.T, alive error) *int {
+	t.Helper()
+	calls := 0
+	old := forwarderAlive
+	forwarderAlive = func(context.Context, corpEnv) error {
+		calls++
+		return alive
+	}
+	t.Cleanup(func() { forwarderAlive = old })
+	return &calls
+}
+
+// s5HealthyDeps returns deps whose S5 verify passes: the scoped resolver file
+// (the bank domain, the only one) is staged in a temp dir standing in for
+// /etc/resolver and route -n get for the bank address resolves via the VM
+// gateway. The forwarder-liveness seam is stubbed alive for the same reason.
 func s5HealthyDeps(t *testing.T, env *corpEnv) stepDeps {
 	t.Helper()
 	dir := t.TempDir()
-	for _, dom := range env.CorpDomains {
-		if err := os.WriteFile(filepath.Join(dir, dom), []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, env.BankDomain), []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	env.StateDir = dir
+	withForwarderAlive(t, nil) // S5 healthy: forwarder answers
 	return stepDeps{
 		runHost: (&hostExecFake{out: map[string]string{
 			"route -n get " + testBankAddr.String(): "   route to: 10.15.0.82\ndestination: 10.15.0.82\n    gateway: 192.168.64.2\n  interface: bridge100\n",
@@ -150,6 +187,7 @@ func TestStepsHostBuildComposesS1ThroughS6(t *testing.T) {
 func TestStepsHostS5EnsurePassesBankAddrsViaEnv(t *testing.T) {
 	env := testCorpEnv(t)
 	withBankAddrs(t, nil, testBankAddr, testExcludedAddr)
+	withGuestDNS(t, "") // guest silent: the stale assembly values must survive
 	sudo := &sudoFake{reached: true}
 	d := stepDeps{
 		runSudo:  sudo.run,
@@ -235,6 +273,7 @@ func TestStepsHostS5EnsureSkipsExcludedAddrWithMessage(t *testing.T) {
 func TestStepsHostS5SudoersMissingNoTTYHintsInstall(t *testing.T) {
 	env := testCorpEnv(t)
 	withBankAddrs(t, nil, testBankAddr)
+	withGuestDNS(t, "")
 	sudo := &sudoFake{reached: false, err: errors.New("exit status 1")}
 	routeUpCalled := false
 	d := stepDeps{
@@ -259,6 +298,7 @@ func TestStepsHostS5SudoersMissingNoTTYHintsInstall(t *testing.T) {
 func TestStepsHostS5SudoersMissingWithTTYFallsBackToScript(t *testing.T) {
 	env := testCorpEnv(t)
 	withBankAddrs(t, nil, testBankAddr)
+	withGuestDNS(t, "")
 	sudo := &sudoFake{reached: false, err: errors.New("exit status 1")}
 	routeUpEnvs := [][]string{}
 	d := stepDeps{
@@ -291,6 +331,7 @@ func TestStepsHostS5SudoersMissingWithTTYFallsBackToScript(t *testing.T) {
 func TestStepsHostS5ToleratesArpFlushAndFwdFailures(t *testing.T) {
 	env := testCorpEnv(t)
 	withBankAddrs(t, nil, testBankAddr)
+	withGuestDNS(t, "")
 
 	var calls [][]string
 	outs := []struct {
@@ -298,8 +339,8 @@ func TestStepsHostS5ToleratesArpFlushAndFwdFailures(t *testing.T) {
 		err     error
 	}{
 		{false, errors.New("sudo refused arp-flush")}, // best-effort before net-up
-		{true, nil},                                   // net-up ok
-		{true, errors.New("forwarder died")},          // best-effort after net-up
+		{true, nil},                          // net-up ok
+		{true, errors.New("forwarder died")}, // best-effort after net-up
 	}
 	i := 0
 	d := stepDeps{
@@ -328,6 +369,7 @@ func TestStepsHostS5EnsureFailsWhenForwarderUnreachable(t *testing.T) {
 		return nil, errors.New("forwarder 127.0.0.1: resolve btg.wb-bank.ru: i/o timeout")
 	}
 	t.Cleanup(func() { bankAddrsFn = old })
+	withGuestDNS(t, "")
 	sudo := &sudoFake{reached: true}
 	d := stepDeps{
 		runSudo:  sudo.run,
@@ -347,18 +389,115 @@ func TestStepsHostS5EnsureFailsWhenForwarderUnreachable(t *testing.T) {
 func TestStepsHostS5VerifyDetectsMissingResolverFile(t *testing.T) {
 	env := testCorpEnv(t)
 	withBankAddrs(t, nil, testBankAddr)
-	env.CorpDomains = []string{"corp.example", "intranet.example"}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "corp.example"), []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
+	// A legacy corp-domain file may exist; only the bank-domain file counts.
+	if err := os.WriteFile(filepath.Join(dir, env.CorpDomains[0]), []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	d := s5HealthyDeps(t, env)
-	d.resolverDir = dir // one domain file staged, intranet.example deliberately missing
+	d.resolverDir = dir // the bank.example file is deliberately missing
 
 	steps := stepsHost(d, env)
 	err := steps[0].Verify(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "intranet.example") {
-		t.Fatalf("verify = %v, want a missing-resolver error for intranet.example", err)
+	if err == nil || !strings.Contains(err.Error(), env.BankDomain) {
+		t.Fatalf("verify = %v, want a missing-resolver error for %s", err, env.BankDomain)
+	}
+}
+
+// The probe domain is the bank domain: legacy CORP_DOMAINS entries (e.g.
+// wb.ru) are not served by the scoped forwarder and resolve to NXDOMAIN, so
+// S6 must ask for BANK_DOMAIN, not CORP_DOMAINS[0].
+func TestStepsHostS6ProbeUsesBankDomain(t *testing.T) {
+	env := testCorpEnv(t)
+	withBankAddrs(t, nil, testBankAddr)
+	d := s5HealthyDeps(t, env) // S5 healthy so the verify pass reaches S6
+	var gotDomain, gotHost string
+	d.check = func(_ context.Context, domain, host string) error {
+		gotDomain, gotHost = domain, host
+		return nil
+	}
+
+	steps := stepsHost(d, env)
+	if err := steps[1].Verify(context.Background()); err != nil {
+		t.Fatalf("verify = %v, want nil", err)
+	}
+	if gotDomain != env.BankDomain || gotHost != env.CheckHost {
+		t.Fatalf("probe = (%q, %q), want (%q, %q)", gotDomain, gotHost, env.BankDomain, env.CheckHost)
+	}
+}
+
+// S5 runs after S4 (tunnel up, vpnc-hook parked the fresh gateway-pushed DNS
+// in /run/corpvpn/vpn-dns), while env.CorpDNS may be stale cache from an
+// older session. The refresh at the top of Ensure must feed the FRESH servers
+// to root-net-up and root-dns-fwd through the same environ and rewrite the
+// corp-dns cache file.
+func TestStepsHostS5EnsureRefreshesCorpDNSFromGuest(t *testing.T) {
+	env := testCorpEnv(t)
+	env.CorpDNS = []string{"10.108.67.4", "10.108.67.5"} // stale cache
+	withBankAddrs(t, nil, testBankAddr)
+	limaCalls := withGuestDNS(t, "10.24.67.4 10.24.67.5\n")
+	sudo := &sudoFake{reached: true}
+	d := stepDeps{
+		runSudo:  sudo.run,
+		stdinTTY: func() bool { return false },
+	}
+
+	steps := stepsHost(d, env)
+	if err := steps[0].Ensure(context.Background()); err != nil {
+		t.Fatalf("ensure = %v, want nil", err)
+	}
+	if len(*limaCalls) != 1 || !strings.Contains((*limaCalls)[0], "/run/corpvpn/vpn-dns") {
+		t.Fatalf("limactl calls = %v, want one guest vpn-dns probe", *limaCalls)
+	}
+	wantDNS := "10.24.67.4 10.24.67.5"
+	for i, verb := range []string{"arp-flush", "net-up", "dns-fwd"} {
+		saw := map[string]string{}
+		for _, kv := range sudo.envs[i] {
+			k, v, _ := strings.Cut(kv, "=")
+			saw[k] = v
+		}
+		if saw["CORP_DNS"] != wantDNS {
+			t.Fatalf("%s CORP_DNS = %q, want the fresh %q", verb, saw["CORP_DNS"], wantDNS)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(env.StateDir, "corp-dns"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "10.24.67.4\n10.24.67.5\n" {
+		t.Fatalf("corp-dns cache = %q, want refreshed", b)
+	}
+}
+
+// A guest that answers nothing (vpn-dns absent, guest down) must leave the
+// assembled CorpDNS and the cache untouched.
+func TestStepsHostS5EnsureKeepsDNSWhenGuestSilent(t *testing.T) {
+	env := testCorpEnv(t)
+	env.CorpDNS = []string{"10.10.0.1"}
+	withBankAddrs(t, nil, testBankAddr)
+	withGuestDNS(t, "")
+	sudo := &sudoFake{reached: true}
+	d := stepDeps{
+		runSudo:  sudo.run,
+		stdinTTY: func() bool { return false },
+	}
+
+	steps := stepsHost(d, env)
+	if err := steps[0].Ensure(context.Background()); err != nil {
+		t.Fatalf("ensure = %v, want nil", err)
+	}
+	for i, environ := range sudo.envs {
+		saw := map[string]string{}
+		for _, kv := range environ {
+			k, v, _ := strings.Cut(kv, "=")
+			saw[k] = v
+		}
+		if saw["CORP_DNS"] != "10.10.0.1" {
+			t.Fatalf("sudo call #%d CORP_DNS = %q, want the untouched 10.10.0.1", i+1, saw["CORP_DNS"])
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.StateDir, "corp-dns")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("corp-dns cache must stay untouched, stat err = %v", err)
 	}
 }
 
@@ -404,7 +543,7 @@ func TestStepsHostS5VerifyHappyPaths(t *testing.T) {
 		withBankAddrs(t, &msgs, testBankAddr)
 		d := s5HealthyDeps(t, env)
 		d.runHost = (&hostExecFake{out: map[string]string{
-			"route -n get 10.15.0.82": "   route to: 10.15.0.82\n    gateway: 192.168.1.1\n  interface: en0\n",
+			"route -n get 10.15.0.82": "   route to: 10.15.0.82\ndestination: 10.15.0.82\n    gateway: 192.168.1.1\n  interface: en0\n",
 		}}).run
 		steps := stepsHost(d, env)
 		for i := 1; i <= 2; i++ {
@@ -414,6 +553,26 @@ func TestStepsHostS5VerifyHappyPaths(t *testing.T) {
 		}
 		if len(msgs) != 1 {
 			t.Fatalf("contested notifications = %d, want exactly one per episode (%v)", len(msgs), msgs)
+		}
+	})
+	t.Run("destination default is a missing route, not a contest", func(t *testing.T) {
+		// macOS `route -n get` answers with the DEFAULT route entry when no
+		// specific route exists (gateway = the LAN router): the address is
+		// missing, so verify must fail and send the cascade back to ensure.
+		env := testCorpEnv(t)
+		var msgs []string
+		withBankAddrs(t, &msgs, testBankAddr)
+		d := s5HealthyDeps(t, env)
+		d.runHost = (&hostExecFake{out: map[string]string{
+			"route -n get 10.15.0.82": "   route to: 10.15.0.82\ndestination: default\n    gateway: 192.168.176.1\n  interface: en0\n",
+		}}).run
+		steps := stepsHost(d, env)
+		err := steps[0].Verify(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "route to 10.15.0.82 missing, want gateway 192.168.64.2") {
+			t.Fatalf("verify = %v, want the missing-route error for the default-route fallback", err)
+		}
+		if len(msgs) != 0 {
+			t.Fatalf("contested notifications = %v, want none (the fallback is not a contest)", msgs)
 		}
 	})
 	t.Run("recovered contested addr resets the episode", func(t *testing.T) {
@@ -432,6 +591,41 @@ func TestStepsHostS5VerifyHappyPaths(t *testing.T) {
 		}
 		_ = msgs
 	})
+}
+
+// The dns-fwd start is part of S5: when the forwarder process dies while
+// routes and the resolver file are healthy, S5's verify must go red so the
+// reconcile cascade re-ensures S5 (whose dns-fwd up restarts the forwarder)
+// -- S6 has no Ensure of its own and would stay red forever otherwise.
+func TestStepsHostS5VerifyFailsWhenForwarderDead(t *testing.T) {
+	env := testCorpEnv(t)
+	withBankAddrs(t, nil, testBankAddr)
+	d := s5HealthyDeps(t, env)
+	dead := errors.New("forwarder 127.0.0.1:53 does not answer: connection refused")
+	withForwarderAlive(t, dead)
+
+	steps := stepsHost(d, env)
+	err := steps[0].Verify(context.Background())
+	if !errors.Is(err, dead) || !strings.Contains(err.Error(), stepHost) {
+		t.Fatalf("verify = %v, want the forwarder-liveness error wrapped with %q", err, stepHost)
+	}
+}
+
+// A live forwarder keeps S5's verify green: the liveness probe is a pure
+// addition after the existing route/resolver checks, consulted exactly once.
+func TestStepsHostS5VerifyForwarderAlivePassesThrough(t *testing.T) {
+	env := testCorpEnv(t)
+	withBankAddrs(t, nil, testBankAddr)
+	d := s5HealthyDeps(t, env)
+	calls := withForwarderAlive(t, nil)
+
+	steps := stepsHost(d, env)
+	if err := steps[0].Verify(context.Background()); err != nil {
+		t.Fatalf("verify = %v, want nil (routes, resolver and forwarder all healthy)", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("forwarderAlive calls = %d, want exactly 1 per S5 verify", *calls)
+	}
 }
 
 func TestStepsHostS6VerifyFailurePropagates(t *testing.T) {
@@ -511,6 +705,7 @@ func TestStepsHostAssemblyHonorsRootNetOverrides(t *testing.T) {
 				"OVPN_DOMAINS":      "stage.example",
 				"CORP_DNS":          "10.10.0.1 10.10.0.2",
 				"DNS_MODE":          "resolver",
+				"BANK_DOMAIN":       "bank.example",
 			},
 			want: hostops.Config{
 				StateDir:     "/state/from/env",
@@ -518,6 +713,7 @@ func TestStepsHostAssemblyHonorsRootNetOverrides(t *testing.T) {
 				CorpDomains:  []string{"corp.example"},
 				OVPNDomains:  []string{"stage.example"},
 				CorpDNS:      []string{"10.10.0.1", "10.10.0.2"},
+				BankDomain:   "bank.example",
 				DNSMode:      "resolver",
 				IfaceGateway: "192.168.64.5",
 			},
@@ -534,6 +730,7 @@ func TestStepsHostAssemblyHonorsRootNetOverrides(t *testing.T) {
 			want: hostops.Config{
 				StateDir:     "/state",
 				Subnets:      []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")},
+				BankDomain:   "wb-bank.ru", // BANK_DOMAIN unset: the bank-config default scopes the resolver
 				DNSMode:      "primary",
 				IfaceGateway: "192.168.64.5",
 			},
@@ -556,6 +753,7 @@ func TestStepsHostAssemblyHonorsRootNetOverrides(t *testing.T) {
 			for _, k := range []string{
 				"CORPVPN_STATE_DIR", "CORPVPN_GATEWAY", "CORPVPN_SUBNETS",
 				"CORP_SUBNETS", "CORP_DOMAINS", "OVPN_DOMAINS", "CORP_DNS", "DNS_MODE",
+				"BANK_DOMAIN",
 			} {
 				t.Setenv(k, tc.env[k])
 			}
@@ -572,6 +770,9 @@ func TestStepsHostAssemblyHonorsRootNetOverrides(t *testing.T) {
 			if cfg.StateDir != tc.want.StateDir || cfg.IfaceGateway != tc.want.IfaceGateway ||
 				cfg.DNSMode != tc.want.DNSMode {
 				t.Fatalf("scalar fields = %+v, want %+v", cfg, tc.want)
+			}
+			if cfg.BankDomain != tc.want.BankDomain {
+				t.Fatalf("bank domain = %q, want %q", cfg.BankDomain, tc.want.BankDomain)
 			}
 			if !slices.Equal(cfg.Subnets, tc.want.Subnets) {
 				t.Fatalf("subnets = %v, want %v", cfg.Subnets, tc.want.Subnets)
@@ -637,7 +838,8 @@ func TestStepsHostAssembleCorpEnv(t *testing.T) {
 	if !slices.Equal(env.Excluded, []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}) {
 		t.Fatalf("excluded = %v, want [10.20.0.0/16]", env.Excluded)
 	}
-	if env.Gateway != "192.168.64.2" || env.CheckHost != "wiki.corp.example" || env.CorpDomains == nil {
+	if env.Gateway != "192.168.64.2" || env.CheckHost != "wiki.corp.example" || env.CorpDomains == nil ||
+		env.BankDomain != "wb-bank.ru" {
 		t.Fatalf("corpEnv assembly incomplete: %+v", env)
 	}
 }
@@ -647,8 +849,9 @@ func TestStepsHostAssembleCorpEnv(t *testing.T) {
 // an empty CORP_DOMAINS stays an error.
 func TestStepsHostAssembleCorpEnvProbeHostFromBankConfig(t *testing.T) {
 	t.Setenv("CORP_EXCLUDE_SUBNETS", "")
-	t.Setenv("CORP_DOMAINS", "corp.example")
+	t.Setenv("CORP_DOMAINS", "wb.ru wb-bank.ru")
 	t.Setenv("CHECK_HOSTS", "wiki.corp.example") // dead contract: must be ignored
+	t.Setenv("BANK_DOMAIN", "corp.example")      // the S6 probe/resolver scope contract
 	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
 	t.Setenv("CORP_DNS", "10.10.0.1")
 
@@ -662,9 +865,152 @@ func TestStepsHostAssembleCorpEnvProbeHostFromBankConfig(t *testing.T) {
 	if env.CheckHost != "btg.wb-bank.ru" {
 		t.Fatalf("CheckHost = %q, want the bank-config default btg.wb-bank.ru", env.CheckHost)
 	}
+	if env.BankDomain != "corp.example" {
+		t.Fatalf("BankDomain = %q, want BANK_DOMAIN carried into the env", env.BankDomain)
+	}
 
 	t.Setenv("CORP_DOMAINS", "")
 	if _, err := assembleCorpEnv(d); err == nil || !strings.Contains(err.Error(), "CORP_DOMAINS") {
 		t.Fatalf("assemble without CORP_DOMAINS = %v, want an error naming CORP_DOMAINS only", err)
 	}
+}
+
+// healBuildSteps feeds assembleCorpEnv a zero stepDeps{} (only stepsCore's
+// defaults run later), so the assembly itself must default the runLimactl
+// seam used by the CORP_DNS fallback hunt — a nil runner here is a live
+// panic in `corpvpn up`/heal.
+func TestStepsHostAssembleCorpEnvDefaultsRunLimactl(t *testing.T) {
+	fakeUsed := false
+	old := limactlDefault
+	limactlDefault = func(context.Context, ...string) (string, error) {
+		fakeUsed = true
+		// limactl output is already the awk answer from /run/corpvpn/vpn-dns.
+		return "10.140.0.1\n", nil
+	}
+	t.Cleanup(func() { limactlDefault = old })
+
+	t.Setenv("CORP_DNS", "")
+	t.Setenv("CORP_DOMAINS", "wb-bank.ru")
+	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
+
+	env, err := assembleCorpEnv(stepDeps{
+		vmIP: func() (string, error) { return "192.168.64.1", nil },
+	})
+	if err != nil {
+		t.Fatalf("assemble = %v, want nil", err)
+	}
+	if !fakeUsed {
+		t.Fatal("assemble must reach the guest DNS through the limactlDefault seam")
+	}
+	if !slices.Equal(env.CorpDNS, []string{"10.140.0.1"}) {
+		t.Fatalf("CorpDNS = %v, want [10.140.0.1]", env.CorpDNS)
+	}
+}
+
+// ---- 6.4 fix round 8: forwarderAlive must do a real DNS exchange ----
+
+// fakeDNSServer spins a UDP DNS server on an ephemeral 127.0.0.1 port that
+// answers every query with rcode and aAnswers A records (the same
+// dnsmessage types internal/dnsfwd serves); returns the endpoint.
+func fakeDNSServer(t *testing.T, rcode dnsmessage.RCode, aAnswers int) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			var q dnsmessage.Message
+			if q.Unpack(buf[:n]) != nil || len(q.Questions) == 0 {
+				continue
+			}
+			m := dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID:               q.ID,
+					Response:         true,
+					RecursionDesired: q.RecursionDesired,
+					RCode:            rcode,
+				},
+				Questions: q.Questions,
+			}
+			for i := 0; i < aAnswers; i++ {
+				m.Answers = append(m.Answers, dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Questions[0].Name,
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+					Body: &dnsmessage.AResource{A: [4]byte{10, 15, 0, 64}},
+				})
+			}
+			out, perr := m.Pack()
+			if perr != nil {
+				continue
+			}
+			_, _ = pc.WriteTo(out, from)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+// closedUDPEndpoint returns a 127.0.0.1 endpoint nothing listens on.
+func closedUDPEndpoint(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := pc.LocalAddr().String()
+	pc.Close()
+	return addr
+}
+
+// withForwarderEndpoint repoints the forwarderAlive dial target and
+// restores it on cleanup.
+func withForwarderEndpoint(t *testing.T, endpoint string) {
+	t.Helper()
+	old := forwarderEndpoint
+	forwarderEndpoint = endpoint
+	t.Cleanup(func() { forwarderEndpoint = old })
+}
+
+// The probe must exchange DNS with the forwarder itself, not through the Go
+// resolver: the resolver consults /etc/hosts BEFORE DNS, so the legacy
+// hosts entry (10.15.0.64 btg.wb-bank.ru, present on this machine) makes
+// LookupHost succeed even with a dead forwarder and S5 verify stays green
+// forever. CheckHost is deliberately that hosts-file name: under the
+// hosts-blind probe all three cases came out green regardless of the fake
+// server's answer.
+func TestStepsHostForwarderAliveRealDNSExchange(t *testing.T) {
+	env := testCorpEnv(t)
+	env.CheckHost = "btg.wb-bank.ru"
+
+	t.Run("forwarder answering an A record is alive", func(t *testing.T) {
+		withForwarderEndpoint(t, fakeDNSServer(t, dnsmessage.RCodeSuccess, 1))
+		if err := forwarderAlive(context.Background(), *env); err != nil {
+			t.Fatalf("forwarderAlive = %v, want nil", err)
+		}
+	})
+	t.Run("NXDOMAIN from the forwarder is red", func(t *testing.T) {
+		withForwarderEndpoint(t, fakeDNSServer(t, dnsmessage.RCodeNameError, 0))
+		err := forwarderAlive(context.Background(), *env)
+		if err == nil {
+			t.Fatal("forwarderAlive = nil, want an error for NXDOMAIN")
+		}
+		if !strings.Contains(err.Error(), "does not answer") {
+			t.Fatalf("forwarderAlive = %v, want the does-not-answer wrap", err)
+		}
+	})
+	t.Run("nothing listening is red", func(t *testing.T) {
+		withForwarderEndpoint(t, closedUDPEndpoint(t))
+		if err := forwarderAlive(context.Background(), *env); err == nil {
+			t.Fatal("forwarderAlive = nil, want an error with no server behind the endpoint")
+		}
+	})
 }

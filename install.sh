@@ -81,8 +81,9 @@ rm -f "$HOME/Library/LaunchAgents/com.corpvpn.watchdog.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
 # WorkingDirectory в .example -- плейсхолдер: подставляем корень репозитория
 # (install.sh работает из него), иначе launchd стартует daemon с cwd=/ и
-# repoRoot() не находит .env -- демон не сходится никогда.
-sed "s|__REPO_ROOT__|$REPO|" "$REPO/com.corpvpn.daemon.plist.example" > "$HOME/Library/LaunchAgents/com.corpvpn.daemon.plist"
+# repoRoot() не находит .env -- демон не сходится никогда. __USER_HOME__ --
+# то же для stdout/stderr демона (~/Library/Logs/corpvpn-daemon.log).
+sed -e "s|__REPO_ROOT__|$REPO|" -e "s|__USER_HOME__|$HOME|" "$REPO/com.corpvpn.daemon.plist.example" > "$HOME/Library/LaunchAgents/com.corpvpn.daemon.plist"
 if ! launchctl kickstart -k "gui/$uid/com.corpvpn.daemon" 2>/dev/null; then
   launchctl load "$HOME/Library/LaunchAgents/com.corpvpn.daemon.plist"
 fi

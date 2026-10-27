@@ -25,5 +25,19 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<!-- launchd стартует демон с минимальным PATH (/usr/bin:/bin:...), из
+	     которого недоступен limactl (Homebrew) на этапе reconcile env.
+	     install.sh подменяет оба плейсхолдера (__REPO_ROOT__, __USER_HOME__). -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<!-- Без этих ключей stdout/stderr демона под launchd уходят в никуда:
+	     дебажить клин или падение тика нечем. -->
+	<key>StandardOutPath</key>
+	<string>__USER_HOME__/Library/Logs/corpvpn-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>__USER_HOME__/Library/Logs/corpvpn-daemon.log</string>
 </dict>
 </plist>

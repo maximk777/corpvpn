@@ -370,7 +370,7 @@ func notifyContested(addr string) {
 	if _, seen := contestedEpisode.LoadOrStore(addr, true); seen {
 		return
 	}
-	contestedNotifyFn("corpvpn: " + addr + " занят другим VPN-клиентом, маршрут не трогаю")
+	contestedNotifyFn("corpvpn: " + addr + " занят другим VPN-клиентом, возвращаю маршрут")
 }
 
 func resetContested(addr string) { contestedEpisode.Delete(addr) }
@@ -484,11 +484,13 @@ func stepsHost(d stepDeps, env *corpEnv) []reconcile.Step {
 
 // verifyHostNet checks S5's desired state per bank address: every address
 // must resolve via the Lima gateway -- a missing route or a gatewayless
-// clone fails and sends the reconcile back to Ensure; an address a foreign
-// gateway owns is contested: notified once per episode, never fought, never
-// an error. The scoped resolver file (the bank domain, the only one) must
-// carry a nameserver line, and the forwarder must answer: a dead forwarder
-// fails here so the cascade re-ensures S5 and restarts it.
+// clone fails and sends the reconcile back to Ensure. A route held by a
+// foreign gateway on a bank-derived address is a repair condition too
+// (user-approved 2026-10-27): verify fails so the cascade re-ensures S5,
+// which deletes the foreign route and installs ours. The scoped resolver
+// file (the bank domain, the only one) must carry a nameserver line, and
+// the forwarder must answer: a dead forwarder fails here so the cascade
+// re-ensures S5 and restarts it.
 func verifyHostNet(ctx context.Context, d stepDeps, env *corpEnv) error {
 	addrs, err := bankAddrsFn(ctx, *env)
 	if err != nil {
@@ -511,8 +513,12 @@ func verifyHostNet(ctx context.Context, d stepDeps, env *corpEnv) error {
 			// re-ensures S5 and installs it.
 			return fmt.Errorf("route to %s missing, want gateway %s", a, env.Gateway)
 		default:
+			// Foreign-held route on a bank-derived address: repair
+			// condition (user-approved 2026-10-27), not a skip -- fail so
+			// the cascade re-ensures S5, which reclaims the route. The
+			// contested notification stays once per episode.
 			notifyContested(a.String())
-			fmt.Println("занято чужим шлюзом", gw, "-- пропускаю:", a)
+			return fmt.Errorf("route to %s held by foreign gateway %s, want %s", a, gw, env.Gateway)
 		}
 	}
 	if env.BankDomain != "" {

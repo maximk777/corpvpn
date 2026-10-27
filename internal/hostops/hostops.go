@@ -50,8 +50,10 @@ type Config struct {
 	IfaceGateway string         // Lima VM gateway address for `route -n add`
 }
 
-// NetReport is what ApplyNetReport surfaces to the S5 step: the bank hosts
-// that must not be touched because a foreign VPN client owns their route.
+// NetReport is what ApplyNetReport surfaces to the S5 step: the bank
+// addresses whose routes were held by a foreign gateway this pass. They are
+// reclaimed (foreign route deleted, ours installed) but still reported so
+// status shows the contention happened.
 type NetReport struct {
 	Contested []string
 }
@@ -122,9 +124,11 @@ func ApplyNet(ctx context.Context, cfg Config, runExec execFunc) error {
 // cloned gatewayless host route is deleted and re-added via the gateway; a
 // `destination: default` fallback (macOS answers with the default-route
 // entry when nothing specific exists) is not routed yet and gets the add; a
-// specific route via a foreign gateway is never fought -- the address is
-// reported as contested and skipped. Only actually-installed prefixes are
-// recorded.
+// specific route via a foreign gateway is fought (user-approved 2026-10-27:
+// bank-derived addresses are re-claimed, the foreign path is the broken
+// one) -- the foreign route is deleted and ours installed, with the address
+// still reported as contested for visibility. Only actually-installed
+// prefixes are recorded.
 func ApplyNetReport(ctx context.Context, cfg Config, runExec execFunc) (NetReport, error) {
 	if err := cfg.validate(); err != nil {
 		return NetReport{}, err
@@ -172,9 +176,17 @@ func ApplyNetReport(ctx context.Context, cfg Config, runExec execFunc) (NetRepor
 			// as contested here).
 		case gerr == nil:
 			// A specific route via a foreign gateway: another VPN client
-			// owns it -- never fight another world.
+			// (e.g. the user's OpenVPN) pushed its own /32 for the same
+			// bank server, and the corp-DNS-derived address makes the
+			// foreign path the broken one. User-approved deviation from
+			// "never fight another world": delete the foreign route and
+			// fall through to the add. The address stays in Contested so
+			// status shows the contention happened.
 			report.Contested = append(report.Contested, addr)
-			continue
+			if _, err := execHost(ctx, runExec, "route", append([]string{"-n", "delete"}, deleteArgs(p)...)...); err != nil {
+				errs = append(errs, fmt.Errorf("route delete %s: %w", addr, err))
+				continue
+			}
 		}
 		if _, err := execHost(ctx, runExec, "route", "-n", "add", "-net", p.String(), cfg.IfaceGateway); err != nil {
 			errs = append(errs, fmt.Errorf("route add %s: %w", p, err))

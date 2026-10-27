@@ -223,27 +223,40 @@ func TestApplyNetReplacesClonedRoute(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "routes"), "10.52.0.7/32\n")
 }
 
-func TestApplyNetForeignGatewayIsContested(t *testing.T) {
+// A foreign-held route on a bank-derived address is reclaimed, not skipped
+// (user-approved 2026-10-27): the address comes from corp DNS, the user's
+// other VPN client pushed its own /32 for the same bank server and its path
+// is the broken one -- delete the foreign route, install ours, and still
+// record the address in Contested so status shows the contention.
+func TestApplyNetForeignGatewayIsReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	rdir := newResolverDir(t)
 	cfg := bankConfig(dir)
 	cfg.Subnets = cfg.Subnets[:1]
 	var rec fakeExec
-	rec.results = map[string]fakeResult{
-		"route -n get 10.52.0.7": viaForeign("10.52.0.7"),
+	rec.sequence = map[string][]fakeResult{
+		// First get sees the foreign route; after the delete and re-add
+		// the verify get must see our gateway.
+		"route -n get 10.52.0.7": {viaForeign("10.52.0.7"), viaOurs("10.52.0.7")},
 	}
 	rep, err := ApplyNetReport(context.Background(), cfg, rec.exec)
 	if err != nil {
-		t.Fatalf("ApplyNetReport: %v (a foreign gateway must be skipped, not fought)", err)
+		t.Fatalf("ApplyNetReport: %v (a foreign-held route must be reclaimed)", err)
 	}
 	if !slices.Equal(rep.Contested, []string{"10.52.0.7"}) {
-		t.Fatalf("contested = %v, want [10.52.0.7]", rep.Contested)
+		t.Fatalf("contested = %v, want [10.52.0.7] (contention still recorded)", rep.Contested)
 	}
-	if !slices.Equal(rec.calls, []string{"route -n get 10.52.0.7"}) {
-		t.Fatalf("exec calls = %v, want only the route get (no add, no delete)", rec.calls)
+	wantCalls := []string{
+		"route -n get 10.52.0.7",
+		"route -n delete -host 10.52.0.7",
+		"route -n add -net 10.52.0.7/32 192.168.64.2",
+		"route -n get 10.52.0.7",
 	}
-	assertFile(t, filepath.Join(dir, "routes"), "")
-	// DNS is unaffected by a contested route.
+	if !slices.Equal(rec.calls, wantCalls) {
+		t.Fatalf("exec calls = %v, want %v", rec.calls, wantCalls)
+	}
+	assertFile(t, filepath.Join(dir, "routes"), "10.52.0.7/32\n")
+	// DNS is unaffected by the contested reclaim.
 	assertFile(t, filepath.Join(rdir, "wb-bank.ru"), "nameserver 127.0.0.1\n")
 	assertAbsent(t, filepath.Join(rdir, "stage-openvpn"))
 }

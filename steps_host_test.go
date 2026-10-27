@@ -537,7 +537,11 @@ func TestStepsHostS5VerifyHappyPaths(t *testing.T) {
 			t.Fatalf("verify = %v, want a gatewayless-clone error", err)
 		}
 	})
-	t.Run("foreign gateway is contested, notified once per episode, not an error", func(t *testing.T) {
+	t.Run("foreign gateway fails so ensure reclaims the route", func(t *testing.T) {
+		// A foreign-held route on a bank-derived address is a repair
+		// condition (user-approved 2026-10-27): verify fails so the cascade
+		// re-ensures S5, which deletes the foreign route and installs ours.
+		// The contested notification stays once per episode.
 		env := testCorpEnv(t)
 		var msgs []string
 		withBankAddrs(t, &msgs, testBankAddr)
@@ -547,8 +551,9 @@ func TestStepsHostS5VerifyHappyPaths(t *testing.T) {
 		}}).run
 		steps := stepsHost(d, env)
 		for i := 1; i <= 2; i++ {
-			if err := steps[0].Verify(context.Background()); err != nil {
-				t.Fatalf("verify #%d = %v, want nil (contested is never an error)", i, err)
+			err := steps[0].Verify(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "route to 10.15.0.82 held by foreign gateway 192.168.1.1, want 192.168.64.2") {
+				t.Fatalf("verify #%d = %v, want the foreign-gateway error", i, err)
 			}
 		}
 		if len(msgs) != 1 {

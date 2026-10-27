@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -39,7 +40,23 @@ func (f *Forwarder) logf(format string, args ...any) {
 // A malformed datagram is logged and skipped, never fatal. It returns nil
 // once ctx is cancelled.
 func (f *Forwarder) ServeUDP(ctx context.Context, addr string) error {
-	pc, err := net.ListenPacket("udp", addr)
+	// macOS mDNSResponder in system DNS-proxy mode holds a wildcard udp *.53
+	// bind forever, so a plain bind of the specific 127.0.0.1:53 fails with
+	// EADDRINUSE. SO_REUSEADDR lets the more specific bind coexist with the
+	// wildcard holder; the kernel then delivers loopback datagrams to the
+	// most specific socket (ours).
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var serr error
+			if cerr := c.Control(func(fd uintptr) {
+				serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			}); cerr != nil {
+				return cerr
+			}
+			return serr
+		},
+	}
+	pc, err := lc.ListenPacket(ctx, "udp", addr)
 	if err != nil {
 		return fmt.Errorf("dnsfwd: listen %s: %w", addr, err)
 	}

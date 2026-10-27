@@ -334,6 +334,42 @@ func TestUpstreamTimeoutYieldsServfail(t *testing.T) {
 	}
 }
 
+// TestServeUDPServesForeignQueryOnEphemeralPort exercises the SO_REUSEADDR
+// ListenConfig listen path (added to coexist with macOS mDNSResponder's
+// wildcard *.53 bind) directly: ServeUDP on an ephemeral port must still
+// answer a foreign-name query with NXDOMAIN, no upstream contacted.
+func TestServeUDPServesForeignQueryOnEphemeralPort(t *testing.T) {
+	// Reserve an ephemeral port so the test knows where to send; serving on
+	// it goes through the same ListenConfig path as 127.0.0.1:53.
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := pc.LocalAddr().String()
+	pc.Close()
+
+	f := &Forwarder{BankDomain: "wb-bank.ru"}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- f.ServeUDP(ctx, addr) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("ServeUDP: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeUDP did not return after context cancel")
+		}
+	})
+
+	m := exchange(t, addr, buildQuery(7, "example.com.", dnsmessage.TypeA))
+	if m.RCode != dnsmessage.RCodeNameError {
+		t.Errorf("rcode for example.com = %v, want NameError", m.RCode)
+	}
+}
+
 func TestUnderBankDomain(t *testing.T) {
 	f := &Forwarder{BankDomain: "wb-bank.ru"}
 	cases := []struct {

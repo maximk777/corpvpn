@@ -131,10 +131,10 @@ func dispatch(args []string) error {
 	case "root-dns-fwd":
 		return cmdRootDNSFwd(args[1:])
 	case "dnsfwd-run":
-		if len(args) < 3 {
-			return fmt.Errorf("dnsfwd-run <bankDomain> <upstream>")
+		if len(args) < 5 {
+			return fmt.Errorf("dnsfwd-run <bankDomain> <upstream> <routesPath> <guestGW>")
 		}
-		return verbDNSFwdRun(args[1], args[2])
+		return verbDNSFwdRun(args[1], args[2], args[3], args[4])
 	default:
 		return errUsage
 	}
@@ -876,8 +876,8 @@ var (
 	verbHostsDown = func() error {
 		return verbs.HostsDown(hostsFile, os.ReadFile, os.WriteFile)
 	}
-	verbDNSFwdUp = func(selfPath, bankDomain, upstream, pidPath string) (int, error) {
-		return verbs.DNSFwdUp(selfPath, bankDomain, upstream, pidPath)
+	verbDNSFwdUp = func(selfPath, bankDomain, upstream, routesPath, guestGW, pidPath string) (int, error) {
+		return verbs.DNSFwdUp(selfPath, bankDomain, upstream, routesPath, guestGW, pidPath)
 	}
 	verbDNSFwdDown = func(pidPath string) error {
 		return verbs.DNSFwdDown(pidPath)
@@ -1088,13 +1088,19 @@ func cachedHostsEntries(dir string) []verbs.HostsEntry {
 // cmdRootDNSFwd is the root half of the forwarder lifecycle. The sudoers
 // grant pins the argv to exactly `root-dns-fwd up|down` (install.sh), so
 // the bank domain and the upstream server come from the environment the
-// unprivileged caller passes (BANK_DOMAIN, CORP_DNS), never from arguments.
+// unprivileged caller passes (BANK_DOMAIN, CORP_DNS), never from
+// arguments; the guest gateway comes from the same S5 environ
+// (CORPVPN_GATEWAY) and the routes state path from the state dir.
 func cmdRootDNSFwd(args []string) error {
 	sub := ""
 	if len(args) > 0 {
 		sub = args[0]
 	}
 	pidPath := filepath.Join(stateDir(), dnsFwdPid)
+	// Same recorded-routes file the S5 pass maintains (hostops): the
+	// forwarder appends its dynamic /32s there so root-net-down's
+	// RemoveNet deletes them with the static ones.
+	routesPath := filepath.Join(stateDir(), "routes")
 	switch sub {
 	case "up":
 		bc, err := loadBankConfig(os.Getenv)
@@ -1104,6 +1110,12 @@ func cmdRootDNSFwd(args []string) error {
 		dns := strings.Fields(os.Getenv("CORP_DNS"))
 		if len(dns) == 0 {
 			return fmt.Errorf("root-dns-fwd: CORP_DNS пуст -- форвардеру некуда пересылать запросы")
+		}
+		// The S5 environ always carries the guest gateway (steps_host
+		// rootEnviron); without it the dynamic /32s cannot be built.
+		guestGW := os.Getenv("CORPVPN_GATEWAY")
+		if guestGW == "" {
+			return fmt.Errorf("root-dns-fwd: CORPVPN_GATEWAY пуст -- динамические /32 не построить (глагол запускается из S5 с полным окружением)")
 		}
 		self, err := os.Executable()
 		if err != nil {
@@ -1118,7 +1130,7 @@ func cmdRootDNSFwd(args []string) error {
 		if derr := verbDNSFwdDown(pidPath); derr != nil {
 			fmt.Fprintf(os.Stderr, "root-dns-fwd: не погасить старый форвардер: %v (стартую всё равно)\n", derr)
 		}
-		_, err = verbDNSFwdUp(self, bc.BankDomain, dns[0]+":53", pidPath)
+		_, err = verbDNSFwdUp(self, bc.BankDomain, dns[0]+":53", routesPath, guestGW, pidPath)
 		return err
 	case "down":
 		return verbDNSFwdDown(pidPath)

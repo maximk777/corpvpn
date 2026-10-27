@@ -130,11 +130,15 @@ func mustPrefix(s string) netip.Prefix { return netip.MustParsePrefix(s) }
 
 // verbCall records what a dispatch seam fake saw.
 type verbCall struct {
-	called                 bool
-	iface                  string
-	entries                []verbs.HostsEntry
-	self, domain, upstream string
-	pidPath                string
+	called     bool
+	iface      string
+	entries    []verbs.HostsEntry
+	self       string
+	domain     string
+	upstream   string
+	routesPath string
+	guestGW    string
+	pidPath    string
 }
 
 // seam installs a fake into a dispatch seam var and restores it on cleanup.
@@ -274,12 +278,16 @@ func TestCLIVerbDispatch(t *testing.T) {
 		{
 			name: "root-dns-fwd up derives domain and upstream from env",
 			args: []string{"root-dns-fwd", "up"},
-			env:  map[string]string{"CORP_DNS": "10.108.67.4 10.108.67.5"},
+			env: map[string]string{
+				"CORP_DNS":        "10.108.67.4 10.108.67.5",
+				"CORPVPN_GATEWAY": "192.168.64.5",
+			},
 			swap: func(t *testing.T) func() string {
 				call := &verbCall{}
-				seam(t, &verbDNSFwdUp, func(self, bankDomain, upstream, pidPath string) (int, error) {
+				seam(t, &verbDNSFwdUp, func(self, bankDomain, upstream, routesPath, guestGW, pidPath string) (int, error) {
 					call.called = true
-					call.self, call.domain, call.upstream, call.pidPath = self, bankDomain, upstream, pidPath
+					call.self, call.domain, call.upstream = self, bankDomain, upstream
+					call.routesPath, call.guestGW, call.pidPath = routesPath, guestGW, pidPath
 					return 4242, nil
 				})
 				return func() string {
@@ -288,6 +296,12 @@ func TestCLIVerbDispatch(t *testing.T) {
 					}
 					if call.self == "" {
 						return "empty self path"
+					}
+					if call.routesPath != filepath.Join(os.Getenv("CORPVPN_STATE_DIR"), "routes") {
+						return "wrong routes path " + call.routesPath
+					}
+					if call.guestGW != "192.168.64.5" {
+						return "wrong gateway " + call.guestGW
 					}
 					return call.domain + " " + call.upstream + " " + filepath.Base(call.pidPath)
 				}
@@ -333,22 +347,23 @@ func TestCLIVerbDispatch(t *testing.T) {
 		},
 		{
 			name: "dnsfwd-run receives the forwarder arguments",
-			args: []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"},
+			args: []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53", "/state/routes", "192.168.64.5"},
 			swap: func(t *testing.T) func() string {
 				call := &verbCall{}
-				seam(t, &verbDNSFwdRun, func(bankDomain, upstream string) error {
+				seam(t, &verbDNSFwdRun, func(bankDomain, upstream, routesPath, guestGW string) error {
 					call.called = true
 					call.domain, call.upstream = bankDomain, upstream
+					call.routesPath, call.guestGW = routesPath, guestGW
 					return nil
 				})
 				return func() string {
 					if !call.called {
 						return "NOT CALLED"
 					}
-					return call.domain + " " + call.upstream
+					return call.domain + " " + call.upstream + " " + call.routesPath + " " + call.guestGW
 				}
 			},
-			want: func(*testing.T) string { return "wb-bank.ru 10.108.67.4:53" },
+			want: func(*testing.T) string { return "wb-bank.ru 10.108.67.4:53 /state/routes 192.168.64.5" },
 		},
 	}
 	for _, tc := range cases {
@@ -744,17 +759,19 @@ func TestCLIHostNetDownStopsForwarder(t *testing.T) {
 func TestCLIRootDNSFwdUpRestartsForwarder(t *testing.T) {
 	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
 	t.Setenv("CORP_DNS", "10.108.67.4 10.108.67.5")
+	t.Setenv("CORPVPN_GATEWAY", "192.168.64.5")
 
 	var order []string
-	var downPid, upPid, upSelf, upDomain, upUpstream string
+	var downPid, upPid, upSelf, upDomain, upUpstream, upRoutes, upGW string
 	seam(t, &verbDNSFwdDown, func(pidPath string) error {
 		order = append(order, "down")
 		downPid = pidPath
 		return nil
 	})
-	seam(t, &verbDNSFwdUp, func(self, bankDomain, upstream, pidPath string) (int, error) {
+	seam(t, &verbDNSFwdUp, func(self, bankDomain, upstream, routesPath, guestGW, pidPath string) (int, error) {
 		order = append(order, "up")
-		upSelf, upDomain, upUpstream, upPid = self, bankDomain, upstream, pidPath
+		upSelf, upDomain, upUpstream = self, bankDomain, upstream
+		upRoutes, upGW, upPid = routesPath, guestGW, pidPath
 		return 4242, nil
 	})
 
@@ -773,6 +790,12 @@ func TestCLIRootDNSFwdUpRestartsForwarder(t *testing.T) {
 	if upDomain != "wb-bank.ru" || upUpstream != "10.108.67.4:53" {
 		t.Fatalf("up args = %s %s, want wb-bank.ru 10.108.67.4:53 (first CORP_DNS)", upDomain, upUpstream)
 	}
+	if upRoutes != filepath.Join(os.Getenv("CORPVPN_STATE_DIR"), "routes") {
+		t.Fatalf("up routesPath = %q, want the S5 recorded-routes file", upRoutes)
+	}
+	if upGW != "192.168.64.5" {
+		t.Fatalf("up gateway = %q, want CORPVPN_GATEWAY", upGW)
+	}
 }
 
 // A failed stop (e.g. a pid surviving SIGKILL) is a warning, never a reason
@@ -781,10 +804,11 @@ func TestCLIRootDNSFwdUpRestartsForwarder(t *testing.T) {
 func TestCLIRootDNSFwdUpProceedsAfterDownError(t *testing.T) {
 	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
 	t.Setenv("CORP_DNS", "10.108.67.4")
+	t.Setenv("CORPVPN_GATEWAY", "192.168.64.5")
 
 	upRan := false
 	seam(t, &verbDNSFwdDown, func(string) error { return errors.New("pid survived SIGKILL") })
-	seam(t, &verbDNSFwdUp, func(string, string, string, string) (int, error) {
+	seam(t, &verbDNSFwdUp, func(string, string, string, string, string, string) (int, error) {
 		upRan = true
 		return 4242, nil
 	})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	osignal "os/signal"
@@ -65,8 +66,11 @@ func reap(pid int) {
 // the same domain/upstream (pidfile v2); a live child with different args,
 // or a legacy pid-only pidfile whose args are unknown, is stopped first so
 // a rotated upstream never keeps being served by the old child.
+// routesPath and guestGW ride in the child argv (the forwarder installs a
+// /32 per answered bank address); the pidfile keeps recording only
+// domain/upstream, so staleness detection is unchanged.
 // Returns the child pid.
-func DNSFwdUp(selfPath, bankDomain, upstream, pidPath string) (int, error) {
+func DNSFwdUp(selfPath, bankDomain, upstream, routesPath, guestGW, pidPath string) (int, error) {
 	if e, err := readPidEntry(pidPath); err == nil && e.pid > 0 {
 		alive, perr := probePid(e.pid)
 		if perr == nil && alive {
@@ -81,11 +85,12 @@ func DNSFwdUp(selfPath, bankDomain, upstream, pidPath string) (int, error) {
 		}
 	}
 	// Child argv: the main dispatch runs `dnsfwd-run` with the bank
-	// domain and upstream as the following arguments. The child's log
-	// lives next to the pidfile, derived here so the public signature
-	// stays unchanged for callers.
+	// domain, upstream, the shared routes state file and the guest
+	// gateway as the following arguments. The child's log lives next to
+	// the pidfile, derived here so the pidPath argument stays the last
+	// one.
 	logPath := filepath.Join(filepath.Dir(pidPath), "dnsfwd.log")
-	pid, err := spawn(logPath, selfPath, "dnsfwd-run", bankDomain, upstream)
+	pid, err := spawn(logPath, selfPath, "dnsfwd-run", bankDomain, upstream, routesPath, guestGW)
 	if err != nil {
 		return 0, fmt.Errorf("dnsfwd: %w", err)
 	}
@@ -149,12 +154,23 @@ func stopChild(pid int) error {
 }
 
 // DNSFwdRun is the in-process entry of the child: serves UDP DNS on
-// 127.0.0.1:53 until SIGINT/SIGTERM; used by main dispatch, tested
-// indirectly.
-func DNSFwdRun(bankDomain, upstream string) error {
+// 127.0.0.1:53 until SIGINT/SIGTERM and, for every forwarded A answer,
+// ensures a /32 for the answered address via the guest gateway. The /32s
+// are recorded in routesPath (the shared S5 recorded-routes file) so
+// RemoveNet removes them. A missing or unparseable guest gateway only
+// leaves the dynamic route wiring off; DNS forwarding still serves.
+// Used by main dispatch, tested indirectly.
+func DNSFwdRun(bankDomain, upstream, routesPath, guestGW string) error {
 	ctx, stop := osignal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	f := &dnsfwd.Forwarder{BankDomain: bankDomain, Upstream: upstream}
+	if gw, err := netip.ParseAddr(guestGW); err == nil && gw.Is4() && routesPath != "" {
+		state := &dnsfwd.RouteState{Path: routesPath}
+		ri := newRouteInstaller(gw.As4())
+		f.OnAnswer = func(_ string, addr [4]byte) {
+			state.EnsureRoute(addr, gw.As4(), ri, nil)
+		}
+	}
 	return f.ServeUDP(ctx, "127.0.0.1:53")
 }
 

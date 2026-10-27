@@ -53,6 +53,13 @@ func writePidEntry(t *testing.T, path string, pid int, bankDomain, upstream stri
 	}
 }
 
+// Routes/gateway values every DNSFwdUp call site passes through to the
+// spawned dnsfwd-run child.
+const (
+	testRoutesPath = "/var/run/corpvpn/routes"
+	testGuestGW    = "192.168.64.1"
+)
+
 func TestDNSFwdUp(t *testing.T) {
 	t.Run("up writes pidfile and returns pid", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "dnsfwd.pid")
@@ -64,7 +71,7 @@ func TestDNSFwdUp(t *testing.T) {
 			return 4242, nil
 		}, nil, time.Second)
 
-		pid, err := DNSFwdUp("/usr/local/bin/corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		pid, err := DNSFwdUp("/usr/local/bin/corpvpn", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW, pidPath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -74,7 +81,7 @@ func TestDNSFwdUp(t *testing.T) {
 		if gotSelf != "/usr/local/bin/corpvpn" {
 			t.Errorf("selfPath = %q", gotSelf)
 		}
-		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"}; !reflect.DeepEqual(gotArgs, want) {
+		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW}; !reflect.DeepEqual(gotArgs, want) {
 			t.Errorf("args = %v, want %v", gotArgs, want)
 		}
 		b, err := os.ReadFile(pidPath)
@@ -101,7 +108,7 @@ func TestDNSFwdUp(t *testing.T) {
 			return nil // alive
 		}, time.Second)
 
-		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW, pidPath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -142,7 +149,7 @@ func TestDNSFwdUp(t *testing.T) {
 			return nil
 		}, 30*time.Millisecond)
 
-		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW, pidPath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -152,7 +159,7 @@ func TestDNSFwdUp(t *testing.T) {
 		if pid != 4242 {
 			t.Fatalf("pid = %d, want 4242", pid)
 		}
-		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"}; !reflect.DeepEqual(spawnedArgs, want) {
+		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW}; !reflect.DeepEqual(spawnedArgs, want) {
 			t.Errorf("spawn args = %v, want %v", spawnedArgs, want)
 		}
 		b, _ := os.ReadFile(pidPath)
@@ -183,14 +190,14 @@ func TestDNSFwdUp(t *testing.T) {
 			return syscall.ESRCH
 		}, 30*time.Millisecond)
 
-		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW, pidPath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if pid != 4242 {
 			t.Fatalf("pid = %d, want 4242", pid)
 		}
-		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53"}; !reflect.DeepEqual(spawnedArgs, want) {
+		if want := []string{"dnsfwd-run", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW}; !reflect.DeepEqual(spawnedArgs, want) {
 			t.Errorf("spawn args = %v, want %v", spawnedArgs, want)
 		}
 		b, _ := os.ReadFile(pidPath)
@@ -208,7 +215,7 @@ func TestDNSFwdUp(t *testing.T) {
 			return syscall.ESRCH // dead
 		}, time.Second)
 
-		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", pidPath)
+		pid, err := DNSFwdUp("corpvpn", "wb-bank.ru", "10.108.67.4:53", testRoutesPath, testGuestGW, pidPath)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

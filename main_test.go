@@ -734,6 +734,68 @@ func TestCLIHostNetDownStopsForwarder(t *testing.T) {
 	}
 }
 
+// ---- 6.4 fix round 8: root-dns-fwd up always restarts the forwarder ----
+
+// DNSFwdUp short-circuits on a live child with matching args, so a
+// hung-but-alive forwarder survived every ensure forever. The root verb
+// now pairs down before up: every `root-dns-fwd up` must yield a freshly
+// started child. DNSFwdUp's own idempotency contract stays for direct
+// callers and is not exercised here.
+func TestCLIRootDNSFwdUpRestartsForwarder(t *testing.T) {
+	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
+	t.Setenv("CORP_DNS", "10.108.67.4 10.108.67.5")
+
+	var order []string
+	var downPid, upPid, upSelf, upDomain, upUpstream string
+	seam(t, &verbDNSFwdDown, func(pidPath string) error {
+		order = append(order, "down")
+		downPid = pidPath
+		return nil
+	})
+	seam(t, &verbDNSFwdUp, func(self, bankDomain, upstream, pidPath string) (int, error) {
+		order = append(order, "up")
+		upSelf, upDomain, upUpstream, upPid = self, bankDomain, upstream, pidPath
+		return 4242, nil
+	})
+
+	if err := dispatch([]string{"root-dns-fwd", "up"}); err != nil {
+		t.Fatalf("dispatch root-dns-fwd up = %v, want nil", err)
+	}
+	if !slices.Equal(order, []string{"down", "up"}) {
+		t.Fatalf("call order = %v, want down before up (every ensure restarts)", order)
+	}
+	if downPid == "" || downPid != upPid {
+		t.Fatalf("down pidfile %q, up pidfile %q, want the same dnsfwd.pid", downPid, upPid)
+	}
+	if upSelf == "" {
+		t.Fatal("up must receive the executable path")
+	}
+	if upDomain != "wb-bank.ru" || upUpstream != "10.108.67.4:53" {
+		t.Fatalf("up args = %s %s, want wb-bank.ru 10.108.67.4:53 (first CORP_DNS)", upDomain, upUpstream)
+	}
+}
+
+// A failed stop (e.g. a pid surviving SIGKILL) is a warning, never a reason
+// to skip the start: no forwarder at all is worse than a stuck one, and the
+// S5/S6 probes surface the aftermath.
+func TestCLIRootDNSFwdUpProceedsAfterDownError(t *testing.T) {
+	t.Setenv("CORPVPN_STATE_DIR", t.TempDir())
+	t.Setenv("CORP_DNS", "10.108.67.4")
+
+	upRan := false
+	seam(t, &verbDNSFwdDown, func(string) error { return errors.New("pid survived SIGKILL") })
+	seam(t, &verbDNSFwdUp, func(string, string, string, string) (int, error) {
+		upRan = true
+		return 4242, nil
+	})
+	if err := dispatch([]string{"root-dns-fwd", "up"}); err != nil {
+		t.Fatalf("dispatch root-dns-fwd up = %v, want nil (down failure is a warning)", err)
+	}
+	if !upRan {
+		t.Fatal("up must run even when the paired down fails")
+	}
+}
+
 func TestWedgeDriverTicksIncreaseAndCarryCache(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CORPVPN_STATE_DIR", dir)

@@ -781,6 +781,15 @@ func hostOpsConfig() (hostops.Config, error) {
 		CorpDNS:     strings.Fields(os.Getenv("CORP_DNS")),
 		DNSMode:     env("DNS_MODE", "primary"),
 	}
+	// The scoped resolver file is written for the bank domain only (the
+	// forwarder serves only bank names -- a legacy CORP_DOMAINS entry like
+	// wb.ru scoped at the resolver would black-hole its names). BANK_DOMAIN
+	// arrives from the caller's environment, same as in cmdRootDNSFwd.
+	bc, err := loadBankConfig(os.Getenv)
+	if err != nil {
+		return hostops.Config{}, err
+	}
+	cfg.BankDomain = bc.BankDomain
 	switch raw := os.Getenv("CORPVPN_SUBNETS"); {
 	case raw != "":
 		subnets, err := parsePrefixFields(raw)
@@ -1034,11 +1043,15 @@ func sudoVerb(verb string) error {
 // forwarderResolves answers whether the scoped forwarder resolves host,
 // through a pure-Go resolver pinned to the forwarder (the same dial pattern
 // defaultBankAddrs uses): a wedged system resolver must not skew the answer.
+// The query is bounded on both layers -- 3s lookup context and a dial
+// timeout: with the forwarder down an OS-level DNS proxy can silently drop
+// packets to *.53, and the watcher must see "does not answer", not block
+// the daemon tick forever.
 func forwarderResolves(ctx context.Context, host string) bool {
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var d net.Dialer
+			d := net.Dialer{Timeout: 3 * time.Second}
 			return d.DialContext(ctx, network, forwarderAddr+":53")
 		},
 	}
@@ -1095,6 +1108,15 @@ func cmdRootDNSFwd(args []string) error {
 		self, err := os.Executable()
 		if err != nil {
 			self = "corpvpn"
+		}
+		// Always stop before start: DNSFwdUp short-circuits on a live child
+		// with matching args, so a hung-but-alive forwarder would survive
+		// every ensure. A missing pidfile is a no-op inside DNSFwdDown; any
+		// other failure is a warning, not a reason to skip the start --
+		// S5/S6 probes surface the aftermath. DNSFwdUp keeps its own
+		// idempotency contract for direct callers.
+		if derr := verbDNSFwdDown(pidPath); derr != nil {
+			fmt.Fprintf(os.Stderr, "root-dns-fwd: не погасить старый форвардер: %v (стартую всё равно)\n", derr)
 		}
 		_, err = verbDNSFwdUp(self, bc.BankDomain, dns[0]+":53", pidPath)
 		return err
